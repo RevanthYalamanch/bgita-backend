@@ -18,15 +18,39 @@ class LogCreate(BaseModel):
     mood_score: int
     diary_text: str
 
+class AuthRequest(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+    role: str = "user"
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str
+    role: str
+
+# 2. Model for Login (Only needs 2 fields)
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class ChatRequest(BaseModel):
+    message: str
+    context: Optional[str] = None
+
 # Allow your frontend to talk to this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://3000-cs-YOUR-UNIQUE-URL.cloudshell.dev"],
+    allow_origins=[
+        "https://bgita-zker-p0y8yc0ks-revanthyalamanchs-projects.vercel.app",
+        "https://bgita-zker-nklkixmb2-revanthyalamanchs-projects.vercel.app", 
+        "http://localhost:3000" 
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Initialize the Gemini 2.5 model via Vertex AI
 try:
     vertexai.init(project=os.getenv("GOOGLE_CLOUD_PROJECT", "bgita-teacher"), location="us-central1")
@@ -34,9 +58,7 @@ try:
 except Exception as e:
     print(f"Vertex AI Init Error: {e}")
 
-class ChatRequest(BaseModel):
-    message: str
-    context: Optional[str] = None
+
 
 
 
@@ -126,14 +148,10 @@ def chat_with_gita(request: ChatRequest):
     except Exception as e:
         return {"reply": f"An error occurred in the AI engine: {str(e)}"}
 
-class AuthRequest(BaseModel):
-    email: str
-    password: str
-    name: str = ""
-    role: str = "user"
+
 
 @app.post("/api/register")
-def register_user(request: AuthRequest):
+def register_user(request: RegisterRequest):
     try:
         # engine.begin() automatically commits the data to the database!
         with engine.begin() as conn:
@@ -156,10 +174,11 @@ def register_user(request: AuthRequest):
             
     except Exception as e:
         print(f"🚨 REAL DATABASE ERROR: {e}") 
-        return {"status": "error", "message": "Registration failed. Email may already exist."}
+        # 🔥 THE FIX: We must raise a true HTTP error so Next.js doesn't fake a successful login!
+        raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
         
 @app.post("/api/login")
-def login_user(request: AuthRequest):
+def login_user(request: LoginRequest):
     try:
         with engine.connect() as conn:
             hashed_pw = hashlib.sha256(request.password.encode()).hexdigest()
@@ -212,25 +231,3 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db)):
         db.rollback()
         return {"status": "error", "message": str(e)}
 
-from pydantic import BaseModel
-from ai_engine import GitaAIEngine
-
-# Initialize your AI Engine
-ai_engine = GitaAIEngine()
-
-# Define the structure of an incoming chat message
-class ChatRequest(BaseModel):
-    message: str
-
-@app.post("/api/chat")
-async def therapy_chat(request: ChatRequest):
-    try:
-        # Pass the user's message to Vertex AI
-        ai_response = ai_engine.generate_response(request.message)
-        
-        # In case the response is an object, extract the text
-        reply_text = ai_response.text if hasattr(ai_response, 'text') else str(ai_response)
-        
-        return {"reply": reply_text}
-    except Exception as e:
-        return {"reply": f"I'm having trouble connecting to my thoughts right now. (Error: {str(e)})"}
