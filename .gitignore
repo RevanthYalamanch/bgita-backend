@@ -1,4 +1,7 @@
 venv/
 __pycache__/
 .env
+.env.*
+*.bak
 *.zip
+easwaran_new.txt

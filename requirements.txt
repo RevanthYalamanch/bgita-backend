@@ -6,6 +6,7 @@ pydantic==2.9.0
 # AI and Google Cloud Integration
 google-cloud-aiplatform>=1.38.0
 google-auth>=2.26.0
+anthropic[vertex]>=0.40.0
 
 # Utility
 python-multipart==0.0.6
@@ -15,4 +16,4 @@ python-dotenv==1.0.0
 sqlalchemy
 pg8000
 cloud-sql-python-connector
-passlib
+bcrypt>=4.0,<6.0
