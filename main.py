@@ -422,10 +422,17 @@ def register_user(request: RegisterRequest):
             })
             return {"status": "success", "message": f"User registered successfully as {assigned_role}!"}
             
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"🚨 REAL DATABASE ERROR: {e}") 
-        # 🔥 THE FIX: We must raise a true HTTP error so Next.js doesn't fake a successful login!
-        raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
+        # Log the full error server-side only — never leak DB internals (SQL,
+        # schema, password hash) to the client.
+        print(f"🚨 REGISTER ERROR: {e}")
+        msg = str(e).lower()
+        if "duplicate key" in msg or "23505" in msg or "unique constraint" in msg:
+            raise HTTPException(status_code=409, detail="An account with that email already exists.")
+        # Generic failure: still a true HTTP error so the frontend won't fake success.
+        raise HTTPException(status_code=500, detail="Could not create the account. Please try again.")
         
 @app.post("/api/login")
 def login_user(request: LoginRequest):
@@ -491,7 +498,10 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
         return {"status": "success", "message": "Journal entry saved to database!"}
     except Exception as e:
         db.rollback()
-        return {"status": "error", "message": str(e)}
+        # Log server-side only; return a true error status with a generic message
+        # (a 200 here would make the client falsely believe the entry was saved).
+        print(f"🚨 LOG SAVE ERROR: {e}")
+        raise HTTPException(status_code=500, detail="Could not save your entry. Please try again.")
 
 @app.post("/api/lesson/complete")
 def complete_lesson(request: LessonComplete, user: dict = Depends(require_user)):
