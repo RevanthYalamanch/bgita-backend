@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
-from anthropic import AnthropicVertex
+import vertexai
+from vertexai.generative_models import GenerativeModel, Content, Part, GenerationConfig
 import os
 from sqlalchemy import text
 from database import engine, get_db
@@ -17,6 +18,20 @@ from ratelimit import SlidingWindowLimiter
 from sqlalchemy.orm import Session
 from typing import Optional, List, Literal
 import time
+import traceback
+
+
+def _log_exc(label: str, e: Exception):
+    """Print a rich, greppable error line + full traceback.
+
+    Bare `print(f"... {e}")` loses the exception *type* and stack, which is why
+    config errors (e.g. a Vertex 404 on a bad model id) looked like transient
+    blips. This always surfaces type, repr, and traceback so Cloud Run logs tell
+    the whole story.
+    """
+    print(f"🚨 {label}: [{type(e).__name__}] {e!r}")
+    traceback.print_exc()
+
 
 app = FastAPI()
 
@@ -62,7 +77,7 @@ class ChatRequest(BaseModel):
     context: Optional[str] = Field(default=None, max_length=8000)
     session_id: Optional[str] = Field(default="anonymous_session", max_length=128)
     email: Optional[str] = Field(default="unknown_user", max_length=254)
-    # Prior turns of the conversation, oldest first. Lets Claude maintain
+    # Prior turns of the conversation, oldest first. Lets the model maintain
     # context across messages instead of treating each turn as standalone.
     # Capped here so a client can't send an unbounded transcript.
     history: Optional[List[ChatTurn]] = Field(default=None, max_length=50)
@@ -75,7 +90,7 @@ class ChatRequest(BaseModel):
             raise ValueError("message must not be empty")
         return v
 
-# Cap how many prior turns we replay to Claude, to bound prompt size/cost.
+# Cap how many prior turns we replay to the model, to bound prompt size/cost.
 MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "12"))
 
 # Allow your frontend to talk to this backend
@@ -141,33 +156,35 @@ def require_admin(payload: dict = Depends(require_user)):
 
 
 # ---------------------------------------------------------
-# CLAUDE ON VERTEX AI (Model Garden)
+# GEMINI ON VERTEX AI
 # ---------------------------------------------------------
-# NOTE: Anthropic models on Vertex are served from specific regions (Sonnet 4.6
-# is in us-east5, europe-west1, asia-southeast1), which may differ from the
-# region used for Cloud SQL or other Vertex services. Confirm the exact model id
-# and region for your project before deploy.
-#
-# Model: Claude Sonnet 4.6 — a meaningful quality upgrade over Haiku 4.5 for the
-# nuance a therapy assistant needs, at a higher per-token cost. Override with the
-# CLAUDE_MODEL env var (e.g. a pinned "claude-sonnet-4-6@<date>" if your region
-# requires the dated version, or "claude-haiku-4-5@20251001" to revert).
+# Gemini is served from us-central1 (same region as Cloud SQL here), so no
+# special model region is needed. Override the model with the GEMINI_MODEL env
+# var (e.g. "gemini-2.5-pro" for more nuance, or pin a dated version).
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "bgita-teacher")
-CLAUDE_REGION = os.getenv("ANTHROPIC_VERTEX_REGION", "us-east5")
-MODEL_ID = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-# Sonnet 4.6 writes richer, multi-paragraph CBT responses; give it more headroom
-# than Haiku's 1024 so replies don't truncate mid-thought.
-MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "2048"))
+GEMINI_REGION = os.getenv("GEMINI_REGION", "us-central1")
+MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Give responses headroom so multi-paragraph CBT replies don't truncate.
+MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "2048"))
 
+# Log the resolved AI config at startup so a bad model id / region is obvious
+# the moment the container boots — no need to wait for a failed chat to find out.
+print(
+    f"🔧 AI config: project={PROJECT_ID} region={GEMINI_REGION} "
+    f"model={MODEL_ID} max_tokens={MAX_TOKENS}"
+)
+
+# The GenerativeModel is created after SYSTEM_PROMPT is defined (below), since
+# Gemini takes the system prompt as a constructor-time `system_instruction`.
 try:
-    client = AnthropicVertex(project_id=PROJECT_ID, region=CLAUDE_REGION)
+    vertexai.init(project=PROJECT_ID, location=GEMINI_REGION)
+    print("✅ Vertex AI (Gemini) initialized.")
 except Exception as e:
-    print(f"Anthropic Vertex Init Error: {e}")
-    client = None
+    _log_exc("VERTEX AI INIT ERROR", e)
 
-# System prompt: defines the assistant's role and hard rules. With Claude this
-# belongs in the `system` parameter (not interleaved with the user message), so
-# the model treats it as standing instructions rather than user-provided text.
+# System prompt: defines the assistant's role and hard rules. This is passed to
+# Gemini as `system_instruction` (not interleaved with the user message), so the
+# model treats it as standing instructions rather than user-provided text.
 SYSTEM_PROMPT = """You are an empathetic, highly skilled Cognitive Behavioral Therapy (CBT) therapist.
 You draw upon the psychological frameworks found in the Bhagavad Gita, but you MUST present them using modern, accessible, secular western terminology.
 
@@ -194,6 +211,18 @@ Guidelines for your response Formatting (CRITICAL):
 - Use **bold text** to gently emphasize key psychological terms or core takeaways."""
 
 
+# Build the Gemini model now that SYSTEM_PROMPT exists. Gemini treats
+# `system_instruction` as standing instructions, separate from user turns.
+try:
+    model = GenerativeModel(
+        MODEL_ID,
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=GenerationConfig(max_output_tokens=MAX_TOKENS),
+    )
+    print("✅ Gemini GenerativeModel initialized.")
+except Exception as e:
+    _log_exc("GEMINI MODEL INIT ERROR", e)
+    model = None
 
 
 
@@ -230,7 +259,7 @@ def _keyword_search(user_message: str, limit: int):
             """)
             return conn.execute(sql, {"q": user_message, "k": limit}).fetchall()
     except Exception as e:
-        print(f"Keyword search failed (non-fatal): {e}")
+        _log_exc("KEYWORD SEARCH FAILED (non-fatal)", e)
         return []
 
 
@@ -281,7 +310,7 @@ def get_clinical_context(user_message: str) -> str:
         return db_text
 
     except Exception as e:
-        print(f"Semantic search failed: {e}")
+        _log_exc("SEMANTIC SEARCH FAILED", e)
         return "Warning: Could not retrieve from the clinical database."
 
 # ---------------------------------------------------------
@@ -317,16 +346,17 @@ def _log_chat_metrics(request: ChatRequest, prompt_time: float,
                 "output_tokens": output_tokens
             })
     except Exception as db_err:
-        print(f"Failed to log metrics (non-fatal): {db_err}")
+        _log_exc("METRICS LOG FAILED (non-fatal)", db_err)
 
 
 def _build_messages(request: ChatRequest) -> list:
-    """Assemble the Claude `messages` array: prior turns + the current turn.
+    """Assemble the Gemini `contents` list: prior turns + the current turn.
 
     The RAG/lesson context is attached only to the *current* user message so it
-    doesn't bloat every historical turn. Anthropic requires the first message to
-    be from the user, so any leading assistant turns (e.g. the UI's greeting)
-    are dropped.
+    doesn't bloat every historical turn. Gemini uses the roles "user" and
+    "model" (its name for the assistant) and requires the conversation to start
+    with a user turn, so any leading model turns (e.g. the UI's greeting) are
+    dropped.
     """
     clinical_data = get_clinical_context(request.message)
 
@@ -342,18 +372,25 @@ def _build_messages(request: ChatRequest) -> list:
         User Message:
         {request.message}"""
 
-    messages = []
+    contents = []
     for turn in (request.history or [])[-MAX_HISTORY_TURNS:]:
-        messages.append({"role": turn.role, "content": turn.content})
-    # Drop leading assistant turn(s) so the conversation starts with the user.
-    while messages and messages[0]["role"] != "user":
-        messages.pop(0)
-    messages.append({"role": "user", "content": user_content})
-    return messages
+        # Map Anthropic-style "assistant" to Gemini's "model" role.
+        role = "model" if turn.role == "assistant" else "user"
+        contents.append(Content(role=role, parts=[Part.from_text(turn.content)]))
+    # Drop leading model turn(s) so the conversation starts with the user.
+    while contents and contents[0].role != "user":
+        contents.pop(0)
+    contents.append(Content(role="user", parts=[Part.from_text(user_content)]))
+    return contents
 
 
 @app.post("/api/chat")
 def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
+    print(
+        f"💬 /api/chat session={request.session_id} email={request.email} "
+        f"msg_len={len(request.message)} history_turns={len(request.history or [])} "
+        f"has_lesson_ctx={bool(request.context)}"
+    )
     # Safety first: if the user expresses self-harm/suicidal intent, bypass the
     # model and respond with crisis resources directly. Streamed as text/plain so
     # the frontend's streaming reader handles it identically to a normal reply.
@@ -366,28 +403,55 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
 
         return StreamingResponse(crisis_stream(), media_type="text/plain")
 
-    if client is None:
+    if model is None:
+        print("🚨 /api/chat called but Gemini model is None (init failed).")
         raise HTTPException(status_code=503, detail="AI engine is unavailable.")
 
-    messages = _build_messages(request)
+    try:
+        messages = _build_messages(request)
+    except Exception as e:
+        # _build_messages calls get_clinical_context (DB/embeddings) — if that
+        # blows up before streaming starts, surface it instead of a blank 500.
+        _log_exc("CHAT BUILD-MESSAGES ERROR", e)
+        raise HTTPException(status_code=500, detail="Could not prepare your message.")
 
     def stream_reply():
         start_time = time.time()
         input_tokens = output_tokens = 0
         try:
-            with client.messages.stream(
-                model=MODEL_ID,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            ) as stream:
-                for delta in stream.text_stream:
-                    yield delta
-                final = stream.get_final_message()
-                input_tokens = final.usage.input_tokens
-                output_tokens = final.usage.output_tokens
+            print(f"🤖 Calling Vertex model={MODEL_ID} region={GEMINI_REGION} with {len(messages)} messages…")
+            stream = model.generate_content(messages, stream=True)
+            for chunk in stream:
+                # A chunk may carry no text (e.g. a safety-only or usage-only
+                # chunk); guard so we don't raise on .text.
+                try:
+                    if chunk.text:
+                        yield chunk.text
+                except (ValueError, IndexError):
+                    pass
+                usage = getattr(chunk, "usage_metadata", None)
+                if usage:
+                    # Gemini reports cumulative counts; keep the latest seen.
+                    input_tokens = usage.prompt_token_count
+                    output_tokens = usage.candidates_token_count
+            print(f"✅ Vertex reply OK in={input_tokens} out={output_tokens} tokens")
         except Exception as e:
-            print(f"AI streaming error: {e}")
+            # Surface type + traceback, and flag the usual suspects so the next
+            # failure is diagnosable straight from the log line.
+            _log_exc("AI STREAMING ERROR", e)
+            status = getattr(e, "status_code", getattr(e, "code", None))
+            print(
+                f"   ↳ context: status_code={status} model={MODEL_ID} "
+                f"region={GEMINI_REGION} project={PROJECT_ID}"
+            )
+            if status == 404:
+                print("   ↳ HINT: 404 usually means the model id isn't valid or enabled in this region. "
+                      "Check GEMINI_MODEL / GEMINI_REGION.")
+            elif status in (401, 403):
+                print("   ↳ HINT: auth/permission — the Cloud Run service account may lack roles/aiplatform.user, "
+                      "or the Vertex AI API isn't enabled for this project.")
+            elif status == 429:
+                print("   ↳ HINT: Vertex quota/rate limit. Check quotas for the region or back off.")
             yield "\n\n_Sorry — I lost my train of thought there. Could you say that again?_"
 
         prompt_time = round(time.time() - start_time, 2)
@@ -427,7 +491,7 @@ def register_user(request: RegisterRequest):
     except Exception as e:
         # Log the full error server-side only — never leak DB internals (SQL,
         # schema, password hash) to the client.
-        print(f"🚨 REGISTER ERROR: {e}")
+        _log_exc("REGISTER ERROR", e)
         msg = str(e).lower()
         if "duplicate key" in msg or "23505" in msg or "unique constraint" in msg:
             raise HTTPException(status_code=409, detail="An account with that email already exists.")
@@ -469,7 +533,10 @@ def login_user(request: LoginRequest):
         # Let intended HTTP errors (e.g. 401) propagate as-is.
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log full detail server-side; never echo the raw exception (DB/schema)
+        # back to the client.
+        _log_exc("LOGIN ERROR", e)
+        raise HTTPException(status_code=500, detail="Could not log you in. Please try again.")
 
 from sqlalchemy import text
 
@@ -500,7 +567,7 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
         db.rollback()
         # Log server-side only; return a true error status with a generic message
         # (a 200 here would make the client falsely believe the entry was saved).
-        print(f"🚨 LOG SAVE ERROR: {e}")
+        _log_exc("LOG SAVE ERROR", e)
         raise HTTPException(status_code=500, detail="Could not save your entry. Please try again.")
 
 @app.post("/api/lesson/complete")
@@ -528,7 +595,7 @@ def complete_lesson(request: LessonComplete, user: dict = Depends(require_user))
         return {"status": "success", "message": "Lesson progress saved."}
     except Exception as full_err:
         # Most likely the extra columns don't exist — retry with the minimal set.
-        print(f"Full lesson insert failed, retrying minimal: {full_err}")
+        _log_exc("LESSON FULL INSERT FAILED (retrying minimal)", full_err)
 
     try:
         with engine.begin() as conn:
@@ -538,7 +605,7 @@ def complete_lesson(request: LessonComplete, user: dict = Depends(require_user))
             """), {"email": email, "lesson_id": request.lesson_id})
         return {"status": "success", "message": "Lesson progress saved."}
     except Exception as e:
-        print(f"Lesson insert failed: {e}")
+        _log_exc("LESSON INSERT FAILED", e)
         raise HTTPException(status_code=500, detail="Could not save lesson progress.")
 
 
@@ -551,7 +618,8 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                 ai_query = text("SELECT id, session_id, email, prompt_time_sec, input_tokens, output_tokens, created_at FROM ai_metrics_log ORDER BY created_at DESC LIMIT 50")
                 ai_results = conn.execute(ai_query).fetchall()
                 ai_list = [{"id": r[0], "session_id": r[1], "email": r[2], "prompt_time_sec": r[3], "input_tokens": r[4], "output_tokens": r[5], "created_at": str(r[6])} for r in ai_results]
-            except Exception:
+            except Exception as e:
+                _log_exc("ADMIN METRICS: ai_metrics_log read failed (non-fatal)", e)
                 ai_list = [] # Failsafe if table doesn't exist yet
 
             # 2. 📖 Fetch Lesson Progress
@@ -559,7 +627,8 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                 lesson_query = text("SELECT id, email, lesson_id, completed_at FROM lesson_progress ORDER BY completed_at DESC LIMIT 50")
                 lesson_results = conn.execute(lesson_query).fetchall()
                 lesson_list = [{"id": r[0], "email": r[1], "lesson_id": r[2], "completed_at": str(r[3])} for r in lesson_results]
-            except Exception:
+            except Exception as e:
+                _log_exc("ADMIN METRICS: lesson_progress read failed (non-fatal)", e)
                 lesson_list = []
 
             # 3. 📔 Fetch Daily Check-In Logs (Mood Stats)
@@ -568,7 +637,8 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                 log_query = text("SELECT username, mood, timestamp FROM logs ORDER BY timestamp DESC LIMIT 50")
                 log_results = conn.execute(log_query).fetchall()
                 log_list = [{"email": r[0], "mood": r[1], "timestamp": str(r[2])} for r in log_results]
-            except Exception:
+            except Exception as e:
+                _log_exc("ADMIN METRICS: logs read failed (non-fatal)", e)
                 log_list = []
 
             # Send the ultimate data package back to React
@@ -582,5 +652,5 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
             }
             
     except Exception as e:
-        print(f"Admin Dashboard Error: {e}")
+        _log_exc("ADMIN DASHBOARD ERROR", e)
         raise HTTPException(status_code=500, detail="Failed to fetch metrics.")
