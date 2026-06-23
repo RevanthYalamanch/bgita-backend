@@ -712,6 +712,34 @@ def complete_lesson(request: LessonComplete, user: dict = Depends(require_user))
         raise HTTPException(status_code=500, detail="Could not save lesson progress.")
 
 
+@app.get("/api/lesson/progress")
+def get_lesson_progress(user: dict = Depends(require_user)):
+    """Return the authenticated user's lesson progress.
+
+    Lets the frontend restore unlock state from the server (durable + synced
+    across devices) instead of relying solely on the localStorage mirror.
+    `unlocked_level` follows the client's convention: highest completed lesson
+    id + 1 (so a fresh user with no completions starts at 1).
+    """
+    email = user["sub"]  # trust the token, not any client-supplied identity
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT DISTINCT lesson_id FROM lesson_progress WHERE email = :email"),
+                {"email": email},
+            ).fetchall()
+        completed = sorted({r[0] for r in rows if r[0] is not None})
+        unlocked_level = (max(completed) + 1) if completed else 1
+        return {
+            "status": "success",
+            "completed_lessons": completed,
+            "unlocked_level": unlocked_level,
+        }
+    except Exception as e:
+        _log_exc("LESSON PROGRESS READ FAILED", e)
+        raise HTTPException(status_code=500, detail="Could not load your progress.")
+
+
 @app.get("/api/admin/metrics")
 def get_admin_metrics(_admin: dict = Depends(require_admin)):
     try:
