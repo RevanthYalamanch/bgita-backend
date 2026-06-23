@@ -83,6 +83,18 @@ def main():
         except Exception as e:
             print(f"  -> skipped index (non-fatal): {e}")
 
+        # GIN index backing the hybrid keyword search in main.py
+        # (to_tsvector('english', content) @@ plainto_tsquery(...)). Without it
+        # Postgres recomputes the tsvector for every row on each query.
+        try:
+            conn.execute(text(
+                f"CREATE INDEX IF NOT EXISTS {TABLE}_fts ON {TABLE} "
+                f"USING GIN (to_tsvector('english', content))"
+            ))
+            print("  -> created GIN full-text index")
+        except Exception as e:
+            print(f"  -> skipped fts index (non-fatal): {e}")
+
     print(f"Done. Loaded {len(chunks)} chunks into '{TABLE}'.")
 
 

@@ -314,12 +314,14 @@ def get_clinical_context(user_message: str) -> str:
 # ---------------------------------------------------------
 # THE NEW CHAT ENDPOINT
 # ---------------------------------------------------------
-def _log_chat_metrics(request: ChatRequest, prompt_time: float,
-                      input_tokens: int, output_tokens: int):
-    """Persist AI telemetry. Best-effort: never raises into the request path."""
+def _ensure_metrics_table():
+    """Create the AI telemetry table once at startup (idempotent).
+
+    Previously this DDL ran inside _log_chat_metrics on *every* chat request — a
+    needless round-trip per message. Hoisted here so it runs once at boot.
+    """
     try:
         with engine.begin() as conn:
-            # Auto-create the telemetry table
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS ai_metrics_log (
                     id SERIAL PRIMARY KEY,
@@ -331,7 +333,23 @@ def _log_chat_metrics(request: ChatRequest, prompt_time: float,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
+        print("✅ ai_metrics_log table ensured.")
+    except Exception as e:
+        _log_exc("METRICS TABLE INIT FAILED (non-fatal)", e)
 
+
+_ensure_metrics_table()
+
+
+def _log_chat_metrics(request: ChatRequest, prompt_time: float,
+                      input_tokens: int, output_tokens: int):
+    """Persist AI telemetry. Best-effort: never raises into the request path.
+
+    The table is created once at startup by _ensure_metrics_table(), so the hot
+    path here is just the INSERT.
+    """
+    try:
+        with engine.begin() as conn:
             # Insert the stats
             conn.execute(text("""
                 INSERT INTO ai_metrics_log (session_id, email, prompt_time_sec, input_tokens, output_tokens)
