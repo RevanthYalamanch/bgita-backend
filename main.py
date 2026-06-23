@@ -236,26 +236,25 @@ RAG_KEYWORD_CANDIDATES = int(os.getenv("RAG_KEYWORD_CANDIDATES", "10"))
 RAG_MMR_LAMBDA = float(os.getenv("RAG_MMR_LAMBDA", "0.7"))
 
 
-def _keyword_search(user_message: str, limit: int):
+def _keyword_search(conn, user_message: str, limit: int):
     """Lexical full-text search over the corpus (best-effort).
 
     Complements vector search: catches exact terms/proper nouns the embedding
-    might miss ("Arjuna", "dharma", a specific verse). Runs in its own
-    connection so a failure here never disturbs the vector query, and returns []
-    on any error (e.g. an empty/stopword-only query) so the caller degrades to
-    vector-only retrieval.
+    might miss ("Arjuna", "dharma", a specific verse). Reuses the caller's
+    connection (the vector query already ran on it, so a failure here can't
+    disturb those results), and returns [] on any error (e.g. an empty/
+    stopword-only query) so the caller degrades to vector-only retrieval.
     """
     if limit <= 0:
         return []
     try:
-        with engine.connect() as conn:
-            sql = text("""
-                SELECT content, embedding
-                FROM gita_chunks
-                WHERE to_tsvector('english', content) @@ plainto_tsquery('english', :q)
-                LIMIT :k
-            """)
-            return conn.execute(sql, {"q": user_message, "k": limit}).fetchall()
+        sql = text("""
+            SELECT content, embedding
+            FROM gita_chunks
+            WHERE to_tsvector('english', content) @@ plainto_tsquery('english', :q)
+            LIMIT :k
+        """)
+        return conn.execute(sql, {"q": user_message, "k": limit}).fetchall()
     except Exception as e:
         _log_exc("KEYWORD SEARCH FAILED (non-fatal)", e)
         return []
@@ -284,8 +283,9 @@ def get_clinical_context(user_message: str) -> str:
                 LIMIT :n
             """)
             vector_rows = conn.execute(query, {"qvec": qvec_literal, "n": RAG_CANDIDATES}).fetchall()
-
-        keyword_rows = _keyword_search(user_message, RAG_KEYWORD_CANDIDATES)
+            # Reuse the same connection for the keyword pass (saves a second
+            # acquire per turn). Safe because the vector rows are already fetched.
+            keyword_rows = _keyword_search(conn, user_message, RAG_KEYWORD_CANDIDATES)
 
         # Merge both pools, de-duplicating on content. Vector hits come first so
         # they win ties and anchor the fallback order if reranking can't run.

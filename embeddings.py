@@ -10,6 +10,7 @@ Migrated off the deprecated `vertexai.language_models` SDK (removal ~2026-06-24)
 to `google-genai`. The Vertex-backed client uses Application Default Credentials.
 """
 import os
+from functools import lru_cache
 from google import genai
 from google.genai import types
 
@@ -40,8 +41,15 @@ def embed_documents(texts, batch_size=50):
     return out
 
 
+@lru_cache(maxsize=512)
 def embed_query(text_str):
-    """Embed a single user message for retrieval. Returns one float vector."""
+    """Embed a single user message for retrieval. Returns one float vector.
+
+    Cached: identical query strings (repeats, common phrasings) reuse the vector
+    instead of re-hitting the embedding API. The returned list is shared across
+    cache hits, so callers must treat it as read-only (current callers only read
+    it — pgvector literal + cosine rerank).
+    """
     resp = _client.models.embed_content(
         model=EMBED_MODEL,
         contents=[text_str],
