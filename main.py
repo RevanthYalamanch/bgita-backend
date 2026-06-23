@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 import os
+import re
 from sqlalchemy import text
 from database import engine, get_db
 from embeddings import embed_query, to_pgvector_literal, parse_pgvector
@@ -346,6 +347,52 @@ def _log_chat_metrics(request: ChatRequest, prompt_time: float,
         _log_exc("METRICS LOG FAILED (non-fatal)", db_err)
 
 
+# Acknowledgment / continuation phrases that carry no retrievable content. On
+# these turns RAG (an embedding API call + 2 DB queries + injected context
+# tokens) is pure waste, so we skip it and let the conversation history carry
+# the thread.
+_LOW_SIGNAL_PHRASES = {
+    "yes", "no", "ok", "okay", "k", "kk", "sure", "yeah", "yep", "yup", "nope",
+    "nah", "thanks", "thank you", "thx", "ty", "cool", "nice", "great", "good",
+    "right", "true", "exactly", "agreed", "i agree", "fine", "alright",
+    "all right", "got it", "i see", "makes sense", "that makes sense",
+    "sounds good", "tell me more", "go on", "continue", "more",
+    "please continue", "ok thanks", "okay thanks", "thank you so much",
+    "perfect", "awesome", "hmm", "oh", "ah", "wow", "i understand", "understood",
+}
+
+# Filler/stopword tokens; an ultra-short message made only of these is low-signal.
+_FILLER_WORDS = {
+    "a", "an", "the", "i", "you", "it", "that", "this", "so", "well", "and",
+    "but", "ok", "okay", "yes", "no", "yeah", "yep", "nope", "sure", "thanks",
+    "thank", "please", "more", "continue", "go", "on", "right", "true", "cool",
+    "nice", "great", "good", "fine", "hmm", "oh", "ah", "wow", "really", "very",
+    "just", "too", "to", "is", "am", "are", "do",
+}
+
+
+def _should_retrieve(message: str) -> bool:
+    """Decide whether a turn is substantive enough to warrant RAG retrieval.
+
+    Skips clear acknowledgments / continuations ("yes", "tell me more",
+    "ok thanks") and filler-only messages, where embedding + DB lookups would
+    only burn latency, an embedding API call, and prompt tokens on irrelevant
+    passages. Conversation history still carries context, so the model isn't
+    left blind. Conservative by design: anything with real content (including
+    short questions like "why?") still retrieves.
+    """
+    cleaned = re.sub(r"[^a-z\s]", "", message.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return False  # pure punctuation / emoji
+    if cleaned in _LOW_SIGNAL_PHRASES:
+        return False
+    words = cleaned.split()
+    if len(words) <= 3 and all(w in _FILLER_WORDS for w in words):
+        return False
+    return True
+
+
 def _build_messages(request: ChatRequest) -> list:
     """Assemble the Gemini `contents` list: prior turns + the current turn.
 
@@ -355,17 +402,28 @@ def _build_messages(request: ChatRequest) -> list:
     with a user turn, so any leading model turns (e.g. the UI's greeting) are
     dropped.
     """
-    clinical_data = get_clinical_context(request.message)
+    # Gate RAG on low-signal turns: skip the embedding call + DB lookups (and the
+    # injected context tokens) for acknowledgments/continuations like "yes" or
+    # "tell me more", where retrieval adds cost but no value.
+    retrieve = _should_retrieve(request.message)
+    print(f"🔎 RAG retrieval: {'on' if retrieve else 'skipped (low-signal turn)'}")
+    clinical_data = get_clinical_context(request.message) if retrieve else ""
 
     lesson_instructions = ""
     if request.context:
         lesson_instructions = f"\n[CURRENT LESSON CONTEXT]\n{request.context}\nFocus your entire response on guiding the user through this specific lesson and do not change the subject.\n"
 
-    user_content = f"""{lesson_instructions}
+    # Only attach the database block when we actually retrieved something, so
+    # skipped turns don't carry an empty (or token-wasting) context section.
+    db_block = ""
+    if clinical_data:
+        db_block = f"""
         [DATABASE CONTEXT START]
         {clinical_data}
         [DATABASE CONTEXT END]
+"""
 
+    user_content = f"""{lesson_instructions}{db_block}
         User Message:
         {request.message}"""
 
