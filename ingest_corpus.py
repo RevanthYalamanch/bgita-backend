@@ -1,6 +1,11 @@
 # backend/ingest_corpus.py
-"""One-time ingestion: chunk easwaran_new.txt, embed each chunk via Vertex,
-and load the vectors into a pgvector table (`gita_chunks`).
+"""One-time ingestion: chunk the public-domain Gita corpus, embed each chunk via
+Vertex (google-genai), and load the vectors into a pgvector table (`gita_chunks`).
+
+Corpus is Edwin Arnold's public-domain translation "The Song Celestial"
+(Project Gutenberg #2388), saved as gita_public_domain.txt. Per Claude.md, ONLY
+public-domain translations may be ingested — do NOT point CORPUS_PATH at the
+copyrighted Easwaran text.
 
 Run once (re-run safely — it rebuilds the table from scratch):
 
@@ -16,7 +21,7 @@ from sqlalchemy import text
 from database import engine
 from embeddings import embed_documents, to_pgvector_literal, EMBED_MODEL
 
-CORPUS_PATH = os.getenv("CORPUS_PATH", "easwaran_new.txt")
+CORPUS_PATH = os.getenv("CORPUS_PATH", "gita_public_domain.txt")
 TABLE = "gita_chunks"
 MIN_WORDS = 50  # merge paragraphs shorter than this into the previous chunk
 
