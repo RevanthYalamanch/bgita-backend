@@ -338,7 +338,32 @@ def _ensure_metrics_table():
         _log_exc("METRICS TABLE INIT FAILED (non-fatal)", e)
 
 
+def _ensure_lesson_progress_table():
+    """Create the lesson-progress table once at startup (idempotent).
+
+    /api/lesson/complete inserts here and /api/admin/metrics reads it, but the
+    table was never created — so completions silently 500'd. Schema matches both
+    the full and minimal inserts in complete_lesson() and the admin read.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS lesson_progress (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    lesson_id INTEGER,
+                    exercise_data TEXT,
+                    blueprint_data TEXT,
+                    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+        print("✅ lesson_progress table ensured.")
+    except Exception as e:
+        _log_exc("LESSON_PROGRESS TABLE INIT FAILED (non-fatal)", e)
+
+
 _ensure_metrics_table()
+_ensure_lesson_progress_table()
 
 
 def _log_chat_metrics(request: ChatRequest, prompt_time: float,
