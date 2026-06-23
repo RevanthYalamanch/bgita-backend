@@ -1,24 +1,25 @@
 # backend/embeddings.py
-"""Vertex AI text-embedding helper.
+"""Text-embedding helper (google-genai SDK on Vertex AI).
 
 Claude/Anthropic does not provide an embeddings API, so the RAG vector layer
-uses Google's Vertex AI text-embedding model. This lives in one place so both
-the ingestion script (ingest_corpus.py) and the API (main.py) embed text the
-same way — with the same model and dimension.
+uses Google's text-embedding model via the google-genai SDK, pointed at Vertex
+AI. This lives in one place so both the ingestion script (ingest_corpus.py) and
+the API (main.py) embed text the same way — same model and dimension.
 
-NOTE: embeddings run through the *google* vertexai SDK (us-central1 by default),
-which is independent of the AnthropicVertex client used for chat in main.py.
+Migrated off the deprecated `vertexai.language_models` SDK (removal ~2026-06-24)
+to `google-genai`. The Vertex-backed client uses Application Default Credentials.
 """
 import os
-import vertexai
-from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
+from google import genai
+from google.genai import types
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "bgita-teacher")
 EMBED_REGION = os.getenv("VERTEX_EMBED_REGION", "us-central1")
 EMBED_MODEL = os.getenv("VERTEX_EMBED_MODEL", "text-embedding-004")
 
-vertexai.init(project=PROJECT_ID, location=EMBED_REGION)
-_model = TextEmbeddingModel.from_pretrained(EMBED_MODEL)
+# Vertex-backed google-genai client (reads ADC for auth). Created once at import
+# so both embed helpers share a single client.
+_client = genai.Client(vertexai=True, project=PROJECT_ID, location=EMBED_REGION)
 
 
 def embed_documents(texts, batch_size=50):
@@ -30,16 +31,23 @@ def embed_documents(texts, batch_size=50):
     out = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        inputs = [TextEmbeddingInput(t, "RETRIEVAL_DOCUMENT") for t in batch]
-        embeddings = _model.get_embeddings(inputs)
-        out.extend(e.values for e in embeddings)
+        resp = _client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+        )
+        out.extend(e.values for e in resp.embeddings)
     return out
 
 
 def embed_query(text_str):
     """Embed a single user message for retrieval. Returns one float vector."""
-    inp = TextEmbeddingInput(text_str, "RETRIEVAL_QUERY")
-    return _model.get_embeddings([inp])[0].values
+    resp = _client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=[text_str],
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+    )
+    return resp.embeddings[0].values
 
 
 def to_pgvector_literal(vec):

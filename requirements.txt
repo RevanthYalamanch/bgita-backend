@@ -4,12 +4,11 @@ uvicorn[standard]==0.27.0
 pydantic==2.9.0
 
 # AI and Google Cloud Integration
-# Upper bound is a deprecation stopgap: `vertexai.generative_models` (used in
-# main.py) is slated for removal ~2026-06-24. v1.157.0 is confirmed to still
-# ship the module, so we cap below 1.158 to keep redeploys from pulling a
-# version that drops it. Proper fix = migrate to the `google-genai` SDK, then
-# lift this cap.
-google-cloud-aiplatform>=1.38.0,<1.158
+# Chat (main.py) and embeddings (embeddings.py) both run on the google-genai
+# SDK pointed at Vertex AI. This replaced the deprecated `vertexai.*` modules
+# from google-cloud-aiplatform (slated for removal ~2026-06-24), which is no
+# longer imported anywhere and has been dropped.
+google-genai>=2.0.0
 google-auth>=2.26.0
 
 # Utility

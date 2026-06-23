@@ -2,8 +2,8 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
-import vertexai
-from vertexai.generative_models import GenerativeModel, Content, Part, GenerationConfig
+from google import genai
+from google.genai import types
 import os
 from sqlalchemy import text
 from database import engine, get_db
@@ -174,13 +174,15 @@ print(
     f"model={MODEL_ID} max_tokens={MAX_TOKENS}"
 )
 
-# The GenerativeModel is created after SYSTEM_PROMPT is defined (below), since
-# Gemini takes the system prompt as a constructor-time `system_instruction`.
+# Vertex-backed google-genai client. Project/location live on the client; the
+# system prompt + token cap are attached per-request via GEN_CONFIG (built once
+# SYSTEM_PROMPT is defined below). Reads Application Default Credentials.
 try:
-    vertexai.init(project=PROJECT_ID, location=GEMINI_REGION)
-    print("✅ Vertex AI (Gemini) initialized.")
+    client = genai.Client(vertexai=True, project=PROJECT_ID, location=GEMINI_REGION)
+    print("✅ Vertex AI (google-genai) client initialized.")
 except Exception as e:
-    _log_exc("VERTEX AI INIT ERROR", e)
+    _log_exc("GENAI CLIENT INIT ERROR", e)
+    client = None
 
 # System prompt: defines the assistant's role and hard rules. This is passed to
 # Gemini as `system_instruction` (not interleaved with the user message), so the
@@ -211,18 +213,13 @@ Guidelines for your response Formatting (CRITICAL):
 - Use **bold text** to gently emphasize key psychological terms or core takeaways."""
 
 
-# Build the Gemini model now that SYSTEM_PROMPT exists. Gemini treats
-# `system_instruction` as standing instructions, separate from user turns.
-try:
-    model = GenerativeModel(
-        MODEL_ID,
-        system_instruction=SYSTEM_PROMPT,
-        generation_config=GenerationConfig(max_output_tokens=MAX_TOKENS),
-    )
-    print("✅ Gemini GenerativeModel initialized.")
-except Exception as e:
-    _log_exc("GEMINI MODEL INIT ERROR", e)
-    model = None
+# Standing generation config now that SYSTEM_PROMPT exists. Gemini treats
+# `system_instruction` as standing instructions, separate from user turns; the
+# token cap keeps multi-paragraph replies from truncating. Passed on every call.
+GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_PROMPT,
+    max_output_tokens=MAX_TOKENS,
+)
 
 
 
@@ -376,11 +373,11 @@ def _build_messages(request: ChatRequest) -> list:
     for turn in (request.history or [])[-MAX_HISTORY_TURNS:]:
         # Map Anthropic-style "assistant" to Gemini's "model" role.
         role = "model" if turn.role == "assistant" else "user"
-        contents.append(Content(role=role, parts=[Part.from_text(turn.content)]))
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=turn.content)]))
     # Drop leading model turn(s) so the conversation starts with the user.
     while contents and contents[0].role != "user":
         contents.pop(0)
-    contents.append(Content(role="user", parts=[Part.from_text(user_content)]))
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_content)]))
     return contents
 
 
@@ -403,8 +400,8 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
 
         return StreamingResponse(crisis_stream(), media_type="text/plain")
 
-    if model is None:
-        print("🚨 /api/chat called but Gemini model is None (init failed).")
+    if client is None:
+        print("🚨 /api/chat called but google-genai client is None (init failed).")
         raise HTTPException(status_code=503, detail="AI engine is unavailable.")
 
     try:
@@ -420,7 +417,9 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
         input_tokens = output_tokens = 0
         try:
             print(f"🤖 Calling Vertex model={MODEL_ID} region={GEMINI_REGION} with {len(messages)} messages…")
-            stream = model.generate_content(messages, stream=True)
+            stream = client.models.generate_content_stream(
+                model=MODEL_ID, contents=messages, config=GEN_CONFIG
+            )
             for chunk in stream:
                 # A chunk may carry no text (e.g. a safety-only or usage-only
                 # chunk); guard so we don't raise on .text.
@@ -431,9 +430,12 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
                     pass
                 usage = getattr(chunk, "usage_metadata", None)
                 if usage:
-                    # Gemini reports cumulative counts; keep the latest seen.
-                    input_tokens = usage.prompt_token_count
-                    output_tokens = usage.candidates_token_count
+                    # Gemini reports cumulative counts; keep the latest non-null
+                    # seen (intermediate chunks may report None).
+                    if usage.prompt_token_count is not None:
+                        input_tokens = usage.prompt_token_count
+                    if usage.candidates_token_count is not None:
+                        output_tokens = usage.candidates_token_count
             print(f"✅ Vertex reply OK in={input_tokens} out={output_tokens} tokens")
         except Exception as e:
             # Surface type + traceback, and flag the usual suspects so the next
