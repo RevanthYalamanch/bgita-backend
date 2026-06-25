@@ -99,9 +99,13 @@ class LessonAnalyze(BaseModel):
     skill: Optional[str] = Field(default="", max_length=200)
     title: Optional[str] = Field(default="", max_length=300)
     answers: str = Field(min_length=1, max_length=8000)
-    # Internal coaching context for this lesson (data/curriculum.js ai_prompt_context).
-    # Never shown to the user; steers the model's framing.
+    # Internal coaching context for this lesson (data/curriculum.js ai_prompt_context
+    # plus the lesson goal and what the exercise asked). Never shown to the user;
+    # steers the model's framing so the reflection isn't generic/nonsensical.
     context: Optional[str] = Field(default=None, max_length=4000)
+    # "reflect" → short reflection on the Practice-step answers (default).
+    # "takeaway" → a warm response to the commitment the user wrote on the Commit step.
+    mode: Optional[str] = Field(default="reflect", max_length=20)
 
     @field_validator("answers")
     @classmethod
@@ -247,25 +251,51 @@ GEN_CONFIG = types.GenerateContentConfig(
 # answers to a structured exercise; we give them a short, warm analysis they can
 # learn from BEFORE they write their commitment on the next page. Deliberately
 # brief and non-prescriptive — it reflects, it doesn't lecture.
-ANALYSIS_SYSTEM_PROMPT = """You are a warm, encouraging guide helping someone reflect on a short self-reflection exercise they just completed.
+ANALYSIS_SYSTEM_PROMPT = """You are a warm, perceptive guide helping someone learn from a short self-reflection exercise they just completed.
 
-You will be given the person's typed answers to the exercise. Write a brief reflection back to them (about 100-150 words).
+You will be given (a) the goal of the lesson, (b) what the exercise asked them to do, and (c) the person's own typed answers. Use ALL of that so your reflection speaks directly to THIS exercise — never generic. Write about 160-200 words.
 
 YOUR REFLECTION MUST:
 1. Open by validating their effort and whatever feeling they shared — genuinely, not as a formula.
-2. Gently mirror back one specific pattern or insight you notice in THEIR answers (quote or paraphrase their own words so it feels personal).
-3. Offer one small, encouraging observation that helps them see the situation a little more clearly.
-4. End with ONE open question that will help them write a meaningful takeaway on the next step. Do not give them the answer — invite their own.
+2. Mirror back one specific pattern you notice in THEIR answers, quoting or closely paraphrasing their own words so it's unmistakably about them.
+3. Connect what they wrote to the skill this lesson is teaching, in plain language — help them see what their own answers reveal.
+4. End with ONE open question that will help them write a meaningful takeaway on the next step. Do not answer it for them — invite their own.
+
+HARD RULES:
+- Plain, warm, conversational English. No clinical jargon, no Sanskrit, no character names, no scripture references.
+- Never diagnose, never give medical or treatment advice, never claim to replace professional care.
+- Do not invent details they didn't share. Stay grounded in what they actually wrote — if their answers are sparse, reflect honestly on what little they gave rather than inventing.
+- Two or three short paragraphs. No headers, no bullet lists.
+- If the person expresses intent to harm themselves or others, drop the exercise framing and gently urge them to reach out for immediate help (in the US, call or text 988), with warmth and without judgment."""
+
+ANALYSIS_GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=ANALYSIS_SYSTEM_PROMPT,
+    max_output_tokens=int(os.getenv("ANALYSIS_MAX_TOKENS", "600")),
+)
+
+# Response to the Commit-step takeaway (#3). The user has just written the one
+# intention/commitment they're leaving the lesson with; we affirm it, reinforce
+# why it matters, and give one small encouragement — NO new question, because
+# this is the closing beat of the lesson, not the opening of another exercise.
+TAKEAWAY_SYSTEM_PROMPT = """You are a warm, encouraging guide responding to the personal takeaway someone wrote at the end of a short wellbeing lesson.
+
+You will be given (a) the goal of the lesson, (b) the prompt they were answering, and (c) the takeaway/commitment they wrote in their own words. Respond directly to what THEY wrote. Write about 120-160 words.
+
+YOUR RESPONSE MUST:
+1. Warmly acknowledge the specific intention they set, reflecting their own words back so it feels seen.
+2. Reinforce why this takeaway is worth holding onto — tie it to the skill the lesson taught, in plain language.
+3. Offer one small, concrete encouragement for actually carrying it into a real moment this week.
+4. Close with a brief, genuine note of confidence in them. End on encouragement — do NOT ask a question.
 
 HARD RULES:
 - Plain, warm, conversational English. No clinical jargon, no Sanskrit, no character names, no scripture references.
 - Never diagnose, never give medical or treatment advice, never claim to replace professional care.
 - Do not invent details they didn't share. Stay grounded in what they actually wrote.
-- Keep it short and human. No headers, no bullet lists — just two or three short paragraphs.
-- If the person expresses intent to harm themselves or others, drop the exercise framing and gently urge them to reach out for immediate help (in the US, call or text 988), with warmth and without judgment."""
+- Two short paragraphs. No headers, no bullet lists.
+- If the person expresses intent to harm themselves or others, drop the lesson framing and gently urge them to reach out for immediate help (in the US, call or text 988), with warmth and without judgment."""
 
-ANALYSIS_GEN_CONFIG = types.GenerateContentConfig(
-    system_instruction=ANALYSIS_SYSTEM_PROMPT,
+TAKEAWAY_GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=TAKEAWAY_SYSTEM_PROMPT,
     max_output_tokens=int(os.getenv("ANALYSIS_MAX_TOKENS", "600")),
 )
 
@@ -849,19 +879,32 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
         print("🚨 /api/lesson/analyze called but google-genai client is None (init failed).")
         raise HTTPException(status_code=503, detail="AI engine is unavailable.")
 
+    is_takeaway = (request.mode or "reflect").lower() == "takeaway"
+
     framing = ""
     if request.skill or request.title:
-        framing = f"This exercise is part of a lesson on \"{request.skill or request.title}\".\n"
+        framing = f"This is part of a lesson on \"{request.skill or request.title}\".\n"
     if request.context:
-        # Internal coaching context — guides tone/focus, never echoed verbatim.
+        # Internal coaching context — lesson goal + what the exercise asked +
+        # curriculum ai_prompt_context. Guides tone/focus, never echoed verbatim.
         framing += f"[GUIDE CONTEXT — do not quote this to the user]\n{request.context}\n\n"
 
-    user_content = (
-        f"{framing}"
-        "Here are the answers the person typed for this exercise:\n\n"
-        f"{request.answers}\n\n"
-        "Write your brief reflection back to them now."
-    )
+    if is_takeaway:
+        user_content = (
+            f"{framing}"
+            "Here is the takeaway the person wrote to close the lesson:\n\n"
+            f"{request.answers}\n\n"
+            "Write your warm response to their takeaway now."
+        )
+        gen_config = TAKEAWAY_GEN_CONFIG
+    else:
+        user_content = (
+            f"{framing}"
+            "Here are the answers the person typed for this exercise:\n\n"
+            f"{request.answers}\n\n"
+            "Write your brief reflection back to them now."
+        )
+        gen_config = ANALYSIS_GEN_CONFIG
 
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_content)])]
 
@@ -869,9 +912,9 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
         start_time = time.time()
         input_tokens = output_tokens = 0
         try:
-            print(f"🤖 Analyze: calling model={MODEL_ID} region={GEMINI_REGION}…")
+            print(f"🤖 Analyze({'takeaway' if is_takeaway else 'reflect'}): calling model={MODEL_ID} region={GEMINI_REGION}…")
             stream = client.models.generate_content_stream(
-                model=MODEL_ID, contents=contents, config=ANALYSIS_GEN_CONFIG
+                model=MODEL_ID, contents=contents, config=gen_config
             )
             for chunk in stream:
                 try:
@@ -893,7 +936,7 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
         # Reuse the chat telemetry table; session id marks this as a lesson reflection.
         analyze_metrics = ChatRequest(
             message=request.answers[:4000],
-            session_id=f"lesson-analyze-{request.lesson_id}",
+            session_id=f"lesson-{'takeaway' if is_takeaway else 'analyze'}-{request.lesson_id}",
             email=user["sub"],
         )
         _log_chat_metrics(analyze_metrics, round(time.time() - start_time, 2),
