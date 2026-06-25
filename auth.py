@@ -89,7 +89,7 @@ def needs_rehash(stored: str) -> bool:
     return _is_legacy_sha256(stored)
 
 
-def verify_clinician(email: str, code: str):
+def verify_clinician(_email: str, code: str):
     """Authorize a clinician based on the configured access code."""
     if CLINICIAN_KEY and code == CLINICIAN_KEY:
         return {"status": "authorized", "role": "psychiatrist"}

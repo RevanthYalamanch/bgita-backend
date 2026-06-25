@@ -91,6 +91,26 @@ class ChatRequest(BaseModel):
             raise ValueError("message must not be empty")
         return v
 
+class LessonAnalyze(BaseModel):
+    # The user's typed Practice-step answers (human-readable, already serialized
+    # by the client) plus light lesson framing. We stream back a short reflection
+    # the user reads before writing their Commit-step takeaway.
+    lesson_id: int
+    skill: Optional[str] = Field(default="", max_length=200)
+    title: Optional[str] = Field(default="", max_length=300)
+    answers: str = Field(min_length=1, max_length=8000)
+    # Internal coaching context for this lesson (data/curriculum.js ai_prompt_context).
+    # Never shown to the user; steers the model's framing.
+    context: Optional[str] = Field(default=None, max_length=4000)
+
+    @field_validator("answers")
+    @classmethod
+    def _strip_answers(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("answers must not be empty")
+        return v
+
 # Cap how many prior turns we replay to the model, to bound prompt size/cost.
 MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "12"))
 
@@ -220,6 +240,33 @@ Guidelines for your response Formatting (CRITICAL):
 GEN_CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
     max_output_tokens=MAX_TOKENS,
+)
+
+
+# Reflection prompt for the lesson "Practice" step. The user has just typed their
+# answers to a structured exercise; we give them a short, warm analysis they can
+# learn from BEFORE they write their commitment on the next page. Deliberately
+# brief and non-prescriptive — it reflects, it doesn't lecture.
+ANALYSIS_SYSTEM_PROMPT = """You are a warm, encouraging guide helping someone reflect on a short self-reflection exercise they just completed.
+
+You will be given the person's typed answers to the exercise. Write a brief reflection back to them (about 100-150 words).
+
+YOUR REFLECTION MUST:
+1. Open by validating their effort and whatever feeling they shared — genuinely, not as a formula.
+2. Gently mirror back one specific pattern or insight you notice in THEIR answers (quote or paraphrase their own words so it feels personal).
+3. Offer one small, encouraging observation that helps them see the situation a little more clearly.
+4. End with ONE open question that will help them write a meaningful takeaway on the next step. Do not give them the answer — invite their own.
+
+HARD RULES:
+- Plain, warm, conversational English. No clinical jargon, no Sanskrit, no character names, no scripture references.
+- Never diagnose, never give medical or treatment advice, never claim to replace professional care.
+- Do not invent details they didn't share. Stay grounded in what they actually wrote.
+- Keep it short and human. No headers, no bullet lists — just two or three short paragraphs.
+- If the person expresses intent to harm themselves or others, drop the exercise framing and gently urge them to reach out for immediate help (in the US, call or text 988), with warmth and without judgment."""
+
+ANALYSIS_GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=ANALYSIS_SYSTEM_PROMPT,
+    max_output_tokens=int(os.getenv("ANALYSIS_MAX_TOKENS", "600")),
 )
 
 
@@ -511,7 +558,7 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
         # _build_messages calls get_clinical_context (DB/embeddings) — if that
         # blows up before streaming starts, surface it instead of a blank 500.
         _log_exc("CHAT BUILD-MESSAGES ERROR", e)
-        raise HTTPException(status_code=500, detail="Could not prepare your message.")
+        raise HTTPException(status_code=500, detail="Could not prepare your message.") from e
 
     def stream_reply():
         start_time = time.time()
@@ -597,9 +644,9 @@ def register_user(request: RegisterRequest):
         _log_exc("REGISTER ERROR", e)
         msg = str(e).lower()
         if "duplicate key" in msg or "23505" in msg or "unique constraint" in msg:
-            raise HTTPException(status_code=409, detail="An account with that email already exists.")
+            raise HTTPException(status_code=409, detail="An account with that email already exists.") from e
         # Generic failure: still a true HTTP error so the frontend won't fake success.
-        raise HTTPException(status_code=500, detail="Could not create the account. Please try again.")
+        raise HTTPException(status_code=500, detail="Could not create the account. Please try again.") from e
         
 @app.post("/api/login")
 def login_user(request: LoginRequest):
@@ -639,9 +686,8 @@ def login_user(request: LoginRequest):
         # Log full detail server-side; never echo the raw exception (DB/schema)
         # back to the client.
         _log_exc("LOGIN ERROR", e)
-        raise HTTPException(status_code=500, detail="Could not log you in. Please try again.")
+        raise HTTPException(status_code=500, detail="Could not log you in. Please try again.") from e
 
-from sqlalchemy import text
 
 @app.post("/api/logs")
 async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
@@ -671,7 +717,7 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
         # Log server-side only; return a true error status with a generic message
         # (a 200 here would make the client falsely believe the entry was saved).
         _log_exc("LOG SAVE ERROR", e)
-        raise HTTPException(status_code=500, detail="Could not save your entry. Please try again.")
+        raise HTTPException(status_code=500, detail="Could not save your entry. Please try again.") from e
 
 @app.post("/api/lesson/complete")
 def complete_lesson(request: LessonComplete, user: dict = Depends(require_user)):
@@ -709,7 +755,7 @@ def complete_lesson(request: LessonComplete, user: dict = Depends(require_user))
         return {"status": "success", "message": "Lesson progress saved."}
     except Exception as e:
         _log_exc("LESSON INSERT FAILED", e)
-        raise HTTPException(status_code=500, detail="Could not save lesson progress.")
+        raise HTTPException(status_code=500, detail="Could not save lesson progress.") from e
 
 
 @app.get("/api/lesson/progress")
@@ -737,7 +783,123 @@ def get_lesson_progress(user: dict = Depends(require_user)):
         }
     except Exception as e:
         _log_exc("LESSON PROGRESS READ FAILED", e)
-        raise HTTPException(status_code=500, detail="Could not load your progress.")
+        raise HTTPException(status_code=500, detail="Could not load your progress.") from e
+
+
+@app.get("/api/lesson/answers")
+def get_lesson_answers(user: dict = Depends(require_user)):
+    """Return the user's most recent saved answers for each lesson they finished.
+
+    Lets the frontend show "your previous response" and pre-fill the wizard when a
+    user reviews/redoes a lesson. A lesson can have several completion rows (each
+    redo inserts a new one); DISTINCT ON keeps only the latest per lesson_id.
+
+    Degrades to an empty map if the optional exercise_data/blueprint_data columns
+    don't exist on this deployment, so an older schema doesn't 500 the client.
+    """
+    email = user["sub"]  # trust the token, not any client-supplied identity
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT DISTINCT ON (lesson_id)
+                       lesson_id, exercise_data, blueprint_data, completed_at
+                FROM lesson_progress
+                WHERE email = :email
+                ORDER BY lesson_id, completed_at DESC
+            """), {"email": email}).fetchall()
+        answers = {
+            str(r[0]): {
+                "exercise_data": r[1] or "",
+                "blueprint_data": r[2] or "",
+                "completed_at": str(r[3]) if r[3] is not None else None,
+            }
+            for r in rows if r[0] is not None
+        }
+        return {"status": "success", "answers": answers}
+    except Exception as e:
+        # Most likely the extra columns are absent on this schema — not fatal.
+        _log_exc("LESSON ANSWERS READ FAILED (non-fatal)", e)
+        return {"status": "success", "answers": {}}
+
+
+@app.post("/api/lesson/analyze")
+def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
+                   _rl: None = Depends(rate_limit_chat)):
+    """Stream a short reflection on the user's Practice-step answers.
+
+    Mirrors /api/chat: the deterministic crisis layer runs first, then the answers
+    are sent to the model with a reflection-specific system prompt. Streamed as
+    text/plain so the frontend reuses the same streaming reader.
+    """
+    print(
+        f"🪞 /api/lesson/analyze lesson={request.lesson_id} email={user['sub']} "
+        f"answers_len={len(request.answers)}"
+    )
+
+    # Safety first — never route self-harm content through the model.
+    if detect_crisis(request.answers):
+        print(f"⚠️ Crisis language detected in lesson analysis for {user['sub']}")
+
+        def crisis_stream():
+            yield CRISIS_RESPONSE
+
+        return StreamingResponse(crisis_stream(), media_type="text/plain")
+
+    if client is None:
+        print("🚨 /api/lesson/analyze called but google-genai client is None (init failed).")
+        raise HTTPException(status_code=503, detail="AI engine is unavailable.")
+
+    framing = ""
+    if request.skill or request.title:
+        framing = f"This exercise is part of a lesson on \"{request.skill or request.title}\".\n"
+    if request.context:
+        # Internal coaching context — guides tone/focus, never echoed verbatim.
+        framing += f"[GUIDE CONTEXT — do not quote this to the user]\n{request.context}\n\n"
+
+    user_content = (
+        f"{framing}"
+        "Here are the answers the person typed for this exercise:\n\n"
+        f"{request.answers}\n\n"
+        "Write your brief reflection back to them now."
+    )
+
+    contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_content)])]
+
+    def stream_reply():
+        start_time = time.time()
+        input_tokens = output_tokens = 0
+        try:
+            print(f"🤖 Analyze: calling model={MODEL_ID} region={GEMINI_REGION}…")
+            stream = client.models.generate_content_stream(
+                model=MODEL_ID, contents=contents, config=ANALYSIS_GEN_CONFIG
+            )
+            for chunk in stream:
+                try:
+                    if chunk.text:
+                        yield chunk.text
+                except (ValueError, IndexError):
+                    pass
+                usage = getattr(chunk, "usage_metadata", None)
+                if usage:
+                    if usage.prompt_token_count is not None:
+                        input_tokens = usage.prompt_token_count
+                    if usage.candidates_token_count is not None:
+                        output_tokens = usage.candidates_token_count
+            print(f"✅ Analyze reply OK in={input_tokens} out={output_tokens} tokens")
+        except Exception as e:
+            _log_exc("LESSON ANALYZE STREAMING ERROR", e)
+            yield "\n\n_Sorry — I couldn't put my thoughts together just now. You can still continue to the next step._"
+
+        # Reuse the chat telemetry table; session id marks this as a lesson reflection.
+        analyze_metrics = ChatRequest(
+            message=request.answers[:4000],
+            session_id=f"lesson-analyze-{request.lesson_id}",
+            email=user["sub"],
+        )
+        _log_chat_metrics(analyze_metrics, round(time.time() - start_time, 2),
+                          input_tokens, output_tokens)
+
+    return StreamingResponse(stream_reply(), media_type="text/plain")
 
 
 @app.get("/api/admin/metrics")
@@ -784,4 +946,4 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
             
     except Exception as e:
         _log_exc("ADMIN DASHBOARD ERROR", e)
-        raise HTTPException(status_code=500, detail="Failed to fetch metrics.")
+        raise HTTPException(status_code=500, detail="Failed to fetch metrics.") from e
