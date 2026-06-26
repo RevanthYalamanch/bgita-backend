@@ -269,7 +269,7 @@ HARD RULES:
 - If the person expresses intent to harm themselves or others, drop the exercise framing and gently urge them to reach out for immediate help (in the US, call or text 988), with warmth and without judgment."""
 
 ANALYSIS_GEN_CONFIG = types.GenerateContentConfig(
-    system_instruction=ANALYSIS_SYSTEM_PROMPT,
+    system_instruction=SYSTEM_PROMPT,
     max_output_tokens=int(os.getenv("ANALYSIS_MAX_TOKENS", "600")),
 )
 
@@ -295,7 +295,7 @@ HARD RULES:
 - If the person expresses intent to harm themselves or others, drop the lesson framing and gently urge them to reach out for immediate help (in the US, call or text 988), with warmth and without judgment."""
 
 TAKEAWAY_GEN_CONFIG = types.GenerateContentConfig(
-    system_instruction=TAKEAWAY_SYSTEM_PROMPT,
+    system_instruction=SYSTEM_PROMPT,
     max_output_tokens=int(os.getenv("ANALYSIS_MAX_TOKENS", "600")),
 )
 
