@@ -749,6 +749,34 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
         _log_exc("LOG SAVE ERROR", e)
         raise HTTPException(status_code=500, detail="Could not save your entry. Please try again.") from e
 
+
+@app.get("/api/logs")
+def get_daily_logs(user: dict = Depends(require_user), db: Session = Depends(get_db)):
+    """Return the authenticated user's past daily check-ins, most recent first.
+
+    Powers the "view previous diaries" history (6/29 #1). The frontend also uses
+    the most-recent timestamp to tell whether the user has already checked in
+    today, so the Save Entry button only acts once per day.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT mood, reflection, timestamp
+            FROM logs
+            WHERE username = :username AND activity = 'Daily Journal'
+            ORDER BY timestamp DESC
+            LIMIT 90
+        """), {"username": user["sub"]}).fetchall()
+        return {
+            "entries": [
+                {"mood": r[0], "reflection": r[1], "timestamp": str(r[2])}
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        _log_exc("LOG FETCH ERROR", e)
+        raise HTTPException(status_code=500, detail="Could not load your entries.") from e
+
+
 @app.post("/api/lesson/complete")
 def complete_lesson(request: LessonComplete, user: dict = Depends(require_user)):
     """Record that the authenticated user completed a lesson.
