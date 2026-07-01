@@ -253,9 +253,12 @@ GEN_CONFIG = types.GenerateContentConfig(
 # guide's voice is consistent everywhere. The per-mode steering (reflect vs.
 # takeaway) is carried in the user turn assembled in analyze_lesson(), not here.
 # Only the token cap differs from the main chat config (shorter lesson replies).
+# Reflection is capped to ~150 words (see the reflect branch in analyze_lesson).
+# 300 tokens comfortably fits 150 words so the model finishes cleanly rather than
+# truncating mid-thought; the word limit itself is enforced in the prompt.
 ANALYSIS_GEN_CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
-    max_output_tokens=int(os.getenv("ANALYSIS_MAX_TOKENS", "600")),
+    max_output_tokens=int(os.getenv("REFLECT_MAX_TOKENS", "300")),
 )
 
 TAKEAWAY_GEN_CONFIG = types.GenerateContentConfig(
@@ -890,11 +893,26 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
         )
         gen_config = TAKEAWAY_GEN_CONFIG
     else:
+        # Give the reflection real material to build on (like /api/chat): retrieve
+        # relevant corpus passages keyed off the lesson topic + the person's own
+        # words, and inject only when we actually got passages back.
+        db_block = ""
+        retrieval_query = f"{request.skill or request.title or ''} {request.answers}".strip()
+        clinical_data = get_clinical_context(retrieval_query)
+        if clinical_data.startswith("Here is the most relevant"):
+            db_block = (
+                "[DATABASE CONTEXT — weave in only if relevant, never mention the database]\n"
+                f"{clinical_data}\n\n"
+            )
         user_content = (
             f"{framing}"
+            f"{db_block}"
             "Here are the answers the person typed for this exercise:\n\n"
             f"{request.answers}\n\n"
-            "Write your brief reflection back to them now."
+            "Write a thoughtful, well-developed reflection back to them now. "
+            "Validate their feelings, connect their answers to the lesson's insight, "
+            "and leave them with one concrete takeaway or a gentle question. "
+            "Keep your reflection to 150 words or less."
         )
         gen_config = ANALYSIS_GEN_CONFIG
 
