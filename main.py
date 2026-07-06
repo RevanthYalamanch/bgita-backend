@@ -423,8 +423,51 @@ def _ensure_lesson_progress_table():
         _log_exc("LESSON_PROGRESS TABLE INIT FAILED (non-fatal)", e)
 
 
+def _ensure_crisis_events_table():
+    """Create the crisis-events table once at startup (idempotent).
+
+    The chat endpoint's safety layer (detect_crisis) only printed to logs, so
+    at-risk sessions were never persisted. This table captures them so the admin
+    (clinician) portal can surface flagged sessions for triage.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS crisis_events (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(255),
+                    email VARCHAR(255),
+                    message_excerpt TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+        print("✅ crisis_events table ensured.")
+    except Exception as e:
+        _log_exc("CRISIS_EVENTS TABLE INIT FAILED (non-fatal)", e)
+
+
 _ensure_metrics_table()
 _ensure_lesson_progress_table()
+_ensure_crisis_events_table()
+
+
+def _log_crisis_event(request: ChatRequest):
+    """Persist a detected crisis event. Best-effort: never raises into the request path."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO crisis_events (session_id, email, message_excerpt)
+                    VALUES (:session_id, :email, :excerpt)
+                """),
+                {
+                    "session_id": request.session_id,
+                    "email": request.email,
+                    "excerpt": (request.message or "")[:280],
+                },
+            )
+    except Exception as e:
+        _log_exc("CRISIS EVENT LOG FAILED (non-fatal)", e)
 
 
 def _log_chat_metrics(request: ChatRequest, prompt_time: float,
@@ -553,6 +596,9 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
     # the frontend's streaming reader handles it identically to a normal reply.
     if detect_crisis(request.message):
         print(f"⚠️ Crisis language detected for session={request.session_id}")
+        # Persist the flagged session so the clinician portal can surface it.
+        # Done before returning so it isn't tied to the stream being consumed.
+        _log_crisis_event(request)
 
         def crisis_stream():
             yield CRISIS_RESPONSE
@@ -996,16 +1042,108 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                 _log_exc("ADMIN METRICS: logs read failed (non-fatal)", e)
                 log_list = []
 
+            # 4. ⚠️ Fetch flagged crisis sessions (most valuable for a clinician)
+            try:
+                crisis_query = text("SELECT session_id, email, message_excerpt, created_at FROM crisis_events ORDER BY created_at DESC LIMIT 50")
+                crisis_results = conn.execute(crisis_query).fetchall()
+                crisis_list = [{"session_id": r[0], "email": r[1], "message_excerpt": r[2], "created_at": str(r[3])} for r in crisis_results]
+            except Exception as e:
+                _log_exc("ADMIN METRICS: crisis_events read failed (non-fatal)", e)
+                crisis_list = []
+
+            # 5. 📈 Aggregate summary cards. Each stat is independently failsafe so a
+            # single missing table can't blank the whole strip. mood is stored as
+            # TEXT ("1".."5"), so it must be cast before averaging.
+            summary = {}
+            for key, query in (
+                ("active_users", "SELECT COUNT(DISTINCT email) FROM ai_metrics_log"),
+                ("total_chats", "SELECT COUNT(*) FROM ai_metrics_log"),
+                ("avg_latency_sec", "SELECT ROUND(AVG(prompt_time_sec)::numeric, 2) FROM ai_metrics_log"),
+                ("lessons_completed", "SELECT COUNT(*) FROM lesson_progress"),
+                ("avg_mood", "SELECT ROUND(AVG(NULLIF(mood, '')::float)::numeric, 2) FROM logs"),
+                ("crisis_count", "SELECT COUNT(*) FROM crisis_events"),
+            ):
+                try:
+                    val = conn.execute(text(query)).scalar()
+                    summary[key] = float(val) if val is not None else 0
+                except Exception as e:
+                    _log_exc(f"ADMIN METRICS: summary '{key}' failed (non-fatal)", e)
+                    summary[key] = 0
+
             # Send the ultimate data package back to React
             return {
-                "status": "success", 
+                "status": "success",
                 "data": {
+                    "summary": summary,
                     "telemetry": ai_list,
                     "lessons": lesson_list,
-                    "logs": log_list
+                    "logs": log_list,
+                    "crisis": crisis_list
                 }
             }
             
     except Exception as e:
         _log_exc("ADMIN DASHBOARD ERROR", e)
         raise HTTPException(status_code=500, detail="Failed to fetch metrics.") from e
+
+
+@app.get("/api/admin/patient")
+def get_patient_detail(email: str, _admin: dict = Depends(require_admin)):
+    """Per-patient drill-down for the clinician portal.
+
+    Combines one user's mood trajectory, lesson completions, chat volume, and
+    crisis flags into a single view. Every sub-query is independently failsafe so
+    a missing table degrades that field rather than the whole response. The email
+    is always bound as a parameter — never string-formatted into SQL.
+    """
+    try:
+        with engine.connect() as conn:
+            # Mood series ordered ASC (oldest → newest) so the frontend sparkline
+            # reads left-to-right. mood is TEXT; the frontend coerces to number.
+            try:
+                mood_rows = conn.execute(
+                    text("SELECT mood, timestamp FROM logs WHERE username = :email ORDER BY timestamp ASC"),
+                    {"email": email},
+                ).fetchall()
+                mood_series = [{"mood": r[0], "timestamp": str(r[1])} for r in mood_rows]
+            except Exception as e:
+                _log_exc("PATIENT DETAIL: mood_series failed (non-fatal)", e)
+                mood_series = []
+
+            try:
+                lesson_rows = conn.execute(
+                    text("SELECT lesson_id, completed_at FROM lesson_progress WHERE email = :email ORDER BY completed_at DESC"),
+                    {"email": email},
+                ).fetchall()
+                lessons = [{"lesson_id": r[0], "completed_at": str(r[1])} for r in lesson_rows]
+            except Exception as e:
+                _log_exc("PATIENT DETAIL: lessons failed (non-fatal)", e)
+                lessons = []
+
+            def _scalar(query, default=0):
+                try:
+                    val = conn.execute(text(query), {"email": email}).scalar()
+                    return val if val is not None else default
+                except Exception as e:
+                    _log_exc("PATIENT DETAIL: scalar failed (non-fatal)", e)
+                    return default
+
+            chat_count = _scalar("SELECT COUNT(*) FROM ai_metrics_log WHERE email = :email")
+            crisis_count = _scalar("SELECT COUNT(*) FROM crisis_events WHERE email = :email")
+            last_active = _scalar("SELECT MAX(created_at) FROM ai_metrics_log WHERE email = :email", default=None)
+
+            return {
+                "status": "success",
+                "data": {
+                    "email": email,
+                    "mood_series": mood_series,
+                    "lessons": lessons,
+                    "chat_count": int(chat_count),
+                    "crisis_count": int(crisis_count),
+                    "last_active": str(last_active) if last_active is not None else None,
+                },
+            }
+
+    except Exception as e:
+        _log_exc("PATIENT DETAIL ERROR", e)
+        raise HTTPException(status_code=500, detail="Failed to fetch patient detail.") from e
