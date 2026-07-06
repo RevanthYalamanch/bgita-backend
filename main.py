@@ -2,8 +2,8 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types
+import anthropic
+from anthropic import AnthropicVertex
 import os
 import re
 from sqlalchemy import text
@@ -181,42 +181,37 @@ def require_admin(payload: dict = Depends(require_user)):
 
 
 # ---------------------------------------------------------
-# GEMINI (google-genai SDK on Vertex AI)
+# CLAUDE (ANTHROPIC NATIVE API)
 # ---------------------------------------------------------
-# Chat runs on Gemini 2.5 Pro via Vertex AI — billed through GCP and authenticated
-# with Application Default Credentials (the Cloud Run service account; no API key).
-# Same SDK/client pattern as embeddings.py. Region us-central1 (where Cloud SQL and
-# the embedding model also live). Override with GEMINI_MODEL / GEMINI_REGION.
-#
-# ⚠️ Gemini 2.5 Pro is a THINKING model: hidden reasoning tokens count against
-# max_output_tokens, and Pro (unlike Flash) CANNOT disable thinking
-# (thinking_budget=0 → 400). A small cap gets fully consumed by thinking and the
-# reply comes back EMPTY. So every config below BOUNDS thinking_budget and sizes
-# max_output_tokens = budget + generous visible headroom. See the GenerateContentConfig
-# objects built just after SYSTEM_PROMPT.
+# Chat runs on Claude Haiku 4.5 via Anthropic on Vertex AI — billed through GCP
+# and authenticated with Application Default Credentials (no Anthropic API key).
+# NOTE: Claude on Vertex is served from specific regions (e.g. us-east5), NOT
+# us-central1 where Cloud SQL / Gemini embeddings live — hence a separate region
+# var. Vertex model ids use the dated '@'-suffixed form. Override either with the
+# CLAUDE_MODEL / ANTHROPIC_VERTEX_REGION env vars. Requires the Claude model to be
+# enabled in Vertex Model Garden and the service account to have roles/aiplatform.user.
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "bgita-teacher")
-GEMINI_REGION = os.getenv("GEMINI_REGION", "us-central1")
-MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-
-# Main chat: rich multi-paragraph CBT replies + room for Pro's reasoning.
-CHAT_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "4096"))
-CHAT_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "1024"))
+ANTHROPIC_VERTEX_REGION = os.getenv("ANTHROPIC_VERTEX_REGION", "us-east5")
+MODEL_ID = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5@20251001")
+# Give responses headroom so multi-paragraph CBT replies don't truncate. Anthropic
+# requires max_tokens on every call (unlike Gemini's optional cap).
+MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "2048"))
 
 # Log the resolved AI config at startup so a bad model id / region is obvious the
 # moment the container boots — no need to wait for a failed chat to find out.
 print(
-    f"🔧 AI config: model={MODEL_ID} region={GEMINI_REGION} "
-    f"project={PROJECT_ID} max_tokens={CHAT_MAX_TOKENS} thinking_budget={CHAT_THINKING_BUDGET}"
+    f"🔧 AI config: model={MODEL_ID} region={ANTHROPIC_VERTEX_REGION} "
+    f"project={PROJECT_ID} max_tokens={MAX_TOKENS}"
 )
 
-# Vertex-backed google-genai client (reads ADC for auth — no API key). Project and
-# region live on the client; the system prompt + token caps are passed per-call via
-# a GenerateContentConfig.
+# Anthropic-on-Vertex client. Project/region live on the client; auth is GCP ADC
+# (the Cloud Run service account) — no API key. The system prompt + token cap are
+# passed per-request on client.messages.stream(...), not on the client.
 try:
-    client = genai.Client(vertexai=True, project=PROJECT_ID, location=GEMINI_REGION)
-    print("✅ Gemini (Vertex AI) client initialized.")
+    client = AnthropicVertex(project_id=PROJECT_ID, region=ANTHROPIC_VERTEX_REGION)
+    print("✅ Anthropic (Vertex AI) client initialized.")
 except Exception as e:
-    _log_exc("GEMINI VERTEX CLIENT INIT ERROR", e)
+    _log_exc("ANTHROPIC VERTEX CLIENT INIT ERROR", e)
     client = None
 
 # System prompt: defines the assistant's role and hard rules. This is passed to
@@ -248,40 +243,22 @@ Guidelines for your response Formatting (CRITICAL):
 - Use **bold text** to gently emphasize key psychological terms or core takeaways."""
 
 
-# Per-call generation configs. The system prompt + token cap + thinking budget are
-# passed to generate_content_stream(...) via a GenerateContentConfig on each call.
+# Per-call token caps. On Anthropic, the system prompt (SYSTEM_PROMPT) and
+# max_tokens are passed directly to client.messages.stream(...) on each call, so
+# there are no standing "config" objects — just the caps below.
 #
 # Lesson "Practice" reflection (#2) and Commit-step takeaway (#3) both run on the
 # SAME standard chatbot system prompt as the main chat (SYSTEM_PROMPT) — per the
 # 6/29 request to replace the bespoke lesson prompts with the main one so the
 # guide's voice is consistent everywhere. The per-mode steering (reflect vs.
 # takeaway) is carried in the user turn assembled in analyze_lesson(), not here.
-# Only the token cap differs (shorter lesson replies).
-#
-# ⚠️ THINKING-BUDGET TRAP: these are short-output calls, but Gemini 2.5 Pro still
-# spends hidden thinking tokens that count against max_output_tokens. Reflection is
-# capped to ~150 words (~250 tokens) in the prompt, but we must leave headroom for
-# thinking on TOP of that or the visible reply truncates to nothing. So we bound
-# thinking to LESSON_THINKING_BUDGET and set max_output_tokens well above it.
-REFLECT_MAX_TOKENS = int(os.getenv("REFLECT_MAX_TOKENS", "1536"))
-TAKEAWAY_MAX_TOKENS = int(os.getenv("ANALYSIS_MAX_TOKENS", "1536"))
-LESSON_THINKING_BUDGET = int(os.getenv("LESSON_THINKING_BUDGET", "512"))
-
-CHAT_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    max_output_tokens=CHAT_MAX_TOKENS,
-    thinking_config=types.ThinkingConfig(thinking_budget=CHAT_THINKING_BUDGET),
-)
-REFLECT_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    max_output_tokens=REFLECT_MAX_TOKENS,
-    thinking_config=types.ThinkingConfig(thinking_budget=LESSON_THINKING_BUDGET),
-)
-TAKEAWAY_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    max_output_tokens=TAKEAWAY_MAX_TOKENS,
-    thinking_config=types.ThinkingConfig(thinking_budget=LESSON_THINKING_BUDGET),
-)
+# Only the token cap differs from the main chat (shorter lesson replies). Claude
+# Haiku doesn't spend hidden "thinking" tokens by default, so a small cap goes
+# entirely to visible text — no thinking-budget workaround is needed (unlike the
+# Gemini path this replaced). Reflection is capped to ~150 words (enforced in the
+# prompt); 512 tokens leaves comfortable headroom.
+REFLECT_MAX_TOKENS = int(os.getenv("REFLECT_MAX_TOKENS", "512"))
+TAKEAWAY_MAX_TOKENS = int(os.getenv("ANALYSIS_MAX_TOKENS", "600"))
 
 
 
@@ -498,12 +475,12 @@ def _should_retrieve(message: str) -> bool:
 
 
 def _build_messages(request: ChatRequest) -> list:
-    """Assemble the Gemini `contents` list: prior turns + the current turn.
+    """Assemble the Anthropic `messages` list: prior turns + the current turn.
 
     The RAG/lesson context is attached only to the *current* user message so it
-    doesn't bloat every historical turn. Gemini uses the roles "user" and "model"
-    (assistant → "model") and expects the conversation to start with a user turn,
-    so any leading model turns (e.g. the UI's greeting) are dropped.
+    doesn't bloat every historical turn. Anthropic uses the roles "user" and
+    "assistant" and requires the conversation to start with a user turn, so any
+    leading assistant turns (e.g. the UI's greeting) are dropped.
     """
     # Gate RAG on low-signal turns: skip the embedding call + DB lookups (and the
     # injected context tokens) for acknowledgments/continuations like "yes" or
@@ -532,12 +509,12 @@ def _build_messages(request: ChatRequest) -> list:
 
     messages = []
     for turn in (request.history or [])[-MAX_HISTORY_TURNS:]:
-        role = "model" if turn.role == "assistant" else "user"
-        messages.append(types.Content(role=role, parts=[types.Part.from_text(text=turn.content)]))
-    # Drop leading model turn(s) so the conversation starts with the user.
-    while messages and messages[0].role != "user":
+        role = "assistant" if turn.role == "assistant" else "user"
+        messages.append({"role": role, "content": turn.content})
+    # Drop leading assistant turn(s) so the conversation starts with the user.
+    while messages and messages[0]["role"] != "user":
         messages.pop(0)
-    messages.append(types.Content(role="user", parts=[types.Part.from_text(text=user_content)]))
+    messages.append({"role": "user", "content": user_content})
     return messages
 
 
@@ -561,7 +538,7 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
         return StreamingResponse(crisis_stream(), media_type="text/plain")
 
     if client is None:
-        print("🚨 /api/chat called but Gemini (Vertex) client is None (init failed — check ADC / project / region).")
+        print("🚨 /api/chat called but Anthropic (Vertex) client is None (init failed — check ADC / project / region).")
         raise HTTPException(status_code=503, detail="AI engine is unavailable.")
 
     try:
@@ -576,40 +553,38 @@ def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
         start_time = time.time()
         input_tokens = output_tokens = 0
         try:
-            print(f"🤖 Calling Gemini model={MODEL_ID} with {len(messages)} messages…")
-            for chunk in client.models.generate_content_stream(
+            print(f"🤖 Calling Anthropic model={MODEL_ID} with {len(messages)} messages…")
+            with client.messages.stream(
                 model=MODEL_ID,
-                contents=messages,
-                config=CHAT_CONFIG,
-            ):
-                if chunk.text:
-                    yield chunk.text
-                # Usage arrives on chunks (last one is authoritative); some
-                # intermediate chunks report None, so guard every read.
-                usage = getattr(chunk, "usage_metadata", None)
-                if usage:
-                    if usage.prompt_token_count:
-                        input_tokens = usage.prompt_token_count
-                    if usage.candidates_token_count:
-                        output_tokens = usage.candidates_token_count
-            print(f"✅ Gemini reply OK in={input_tokens} out={output_tokens} tokens")
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+            ) as stream:
+                for text_piece in stream.text_stream:
+                    if text_piece:
+                        yield text_piece
+                # Final message carries authoritative token usage.
+                final = stream.get_final_message()
+                input_tokens = final.usage.input_tokens
+                output_tokens = final.usage.output_tokens
+            print(f"✅ Anthropic reply OK in={input_tokens} out={output_tokens} tokens")
         except Exception as e:
             # Surface type + traceback, and flag the usual suspects so the next
             # failure is diagnosable straight from the log line.
             _log_exc("AI STREAMING ERROR", e)
-            status = getattr(e, "code", None) or getattr(e, "status_code", None)
+            status = getattr(e, "status_code", None)
             print(
-                f"   ↳ context: status={status} model={MODEL_ID} "
-                f"region={GEMINI_REGION} project={PROJECT_ID}"
+                f"   ↳ context: status_code={status} model={MODEL_ID} "
+                f"region={ANTHROPIC_VERTEX_REGION} project={PROJECT_ID}"
             )
             if status in (401, 403):
                 print("   ↳ HINT: auth/permission — the Cloud Run service account may lack roles/aiplatform.user, "
-                      "or the Vertex AI API isn't enabled for this project.")
+                      "or Claude isn't enabled in Vertex Model Garden for this project.")
             elif status == 404:
-                print("   ↳ HINT: 404 usually means the model id isn't valid/available in this region. "
-                      "Check GEMINI_MODEL and GEMINI_REGION.")
+                print("   ↳ HINT: 404 usually means the model id isn't valid/enabled in this region. "
+                      "Check CLAUDE_MODEL (dated '@' form) and ANTHROPIC_VERTEX_REGION.")
             elif status == 429:
-                print("   ↳ HINT: Vertex quota/rate limit for Gemini in this region. Request a quota increase or back off.")
+                print("   ↳ HINT: Vertex quota/rate limit for Claude in this region. Request a quota increase or back off.")
             yield "\n\n_Sorry — I lost my train of thought there. Could you say that again?_"
 
         prompt_time = round(time.time() - start_time, 2)
@@ -882,7 +857,7 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
         return StreamingResponse(crisis_stream(), media_type="text/plain")
 
     if client is None:
-        print("🚨 /api/lesson/analyze called but Gemini (Vertex) client is None (init failed — check ADC / project / region).")
+        print("🚨 /api/lesson/analyze called but Anthropic (Vertex) client is None (init failed — check ADC / project / region).")
         raise HTTPException(status_code=503, detail="AI engine is unavailable.")
 
     is_takeaway = (request.mode or "reflect").lower() == "takeaway"
@@ -902,7 +877,7 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
             f"{request.answers}\n\n"
             "Write your warm response to their takeaway now."
         )
-        reply_config = TAKEAWAY_CONFIG
+        reply_max_tokens = TAKEAWAY_MAX_TOKENS
     else:
         # Give the reflection real material to build on (like /api/chat): retrieve
         # relevant corpus passages keyed off the lesson topic + the person's own
@@ -925,28 +900,27 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
             "and leave them with one concrete takeaway or a gentle question. "
             "Keep your reflection to 150 words or less."
         )
-        reply_config = REFLECT_CONFIG
+        reply_max_tokens = REFLECT_MAX_TOKENS
 
-    messages = [types.Content(role="user", parts=[types.Part.from_text(text=user_content)])]
+    messages = [{"role": "user", "content": user_content}]
 
     def stream_reply():
         start_time = time.time()
         input_tokens = output_tokens = 0
         try:
             print(f"🤖 Analyze({'takeaway' if is_takeaway else 'reflect'}): calling model={MODEL_ID}…")
-            for chunk in client.models.generate_content_stream(
+            with client.messages.stream(
                 model=MODEL_ID,
-                contents=messages,
-                config=reply_config,
-            ):
-                if chunk.text:
-                    yield chunk.text
-                usage = getattr(chunk, "usage_metadata", None)
-                if usage:
-                    if usage.prompt_token_count:
-                        input_tokens = usage.prompt_token_count
-                    if usage.candidates_token_count:
-                        output_tokens = usage.candidates_token_count
+                max_tokens=reply_max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+            ) as stream:
+                for text_piece in stream.text_stream:
+                    if text_piece:
+                        yield text_piece
+                final = stream.get_final_message()
+                input_tokens = final.usage.input_tokens
+                output_tokens = final.usage.output_tokens
             print(f"✅ Analyze reply OK in={input_tokens} out={output_tokens} tokens")
         except Exception as e:
             _log_exc("LESSON ANALYZE STREAMING ERROR", e)

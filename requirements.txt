@@ -4,10 +4,13 @@ uvicorn[standard]==0.27.0
 pydantic==2.9.0
 
 # AI Integration
-# Chat (main.py) and embeddings (embeddings.py) both run on the google-genai SDK
-# pointed at Vertex AI (billed through GCP, authenticated with ADC — no API key):
-# chat on gemini-2.5-pro, embeddings on text-embedding-004. google-genai also
-# replaced the deprecated `vertexai.*` modules from google-cloud-aiplatform.
+# Chat (main.py) runs on Claude Haiku 4.5 via Anthropic on Vertex AI (billed
+# through GCP, authenticated with ADC — no separate Anthropic account). The
+# [vertex] extra pulls in the google-auth deps the AnthropicVertex client needs.
+anthropic[vertex]>=0.40.0
+# Embeddings (embeddings.py) still run on the google-genai SDK pointed at Vertex
+# AI (text-embedding-004) — Anthropic has no embeddings API, so this stays. It
+# also replaced the deprecated `vertexai.*` modules from google-cloud-aiplatform.
 google-genai>=2.0.0
 google-auth>=2.26.0
 
