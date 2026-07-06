@@ -3,11 +3,11 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 pydantic==2.9.0
 
-# AI and Google Cloud Integration
-# Chat (main.py) and embeddings (embeddings.py) both run on the google-genai
-# SDK pointed at Vertex AI. This replaced the deprecated `vertexai.*` modules
-# from google-cloud-aiplatform (slated for removal ~2026-06-24), which is no
-# longer imported anywhere and has been dropped.
+# AI Integration
+# Chat (main.py) and embeddings (embeddings.py) both run on the google-genai SDK
+# pointed at Vertex AI (billed through GCP, authenticated with ADC — no API key):
+# chat on gemini-2.5-pro, embeddings on text-embedding-004. google-genai also
+# replaced the deprecated `vertexai.*` modules from google-cloud-aiplatform.
 google-genai>=2.0.0
 google-auth>=2.26.0
 
