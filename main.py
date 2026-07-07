@@ -460,9 +460,13 @@ def _verify_embedding_model():
     try:
         from embeddings import EMBED_MODEL
         with engine.connect() as conn:
+            # Check existence first so the expected pre-ingest state (table absent
+            # because ingest_corpus.py hasn't stamped it yet) yields a clean
+            # warning instead of a DatabaseError + traceback.
+            exists = conn.execute(text("SELECT to_regclass('public.gita_corpus_meta')")).scalar()
             row = conn.execute(text(
                 "SELECT embed_model, dim FROM gita_corpus_meta ORDER BY ingested_at DESC LIMIT 1"
-            )).fetchone()
+            )).fetchone() if exists else None
         if not row:
             print(
                 f"⚠️ Corpus embedding model unknown (gita_corpus_meta empty/absent). "
