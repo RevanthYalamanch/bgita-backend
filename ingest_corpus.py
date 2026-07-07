@@ -77,6 +77,26 @@ def main():
         for i, (content, vec) in enumerate(zip(chunks, vectors)):
             conn.execute(insert, {"i": i, "c": content, "e": to_pgvector_literal(vec)})
 
+        # Stamp which embedding model built this corpus. Query vectors MUST come
+        # from the same model or cosine search compares vectors from different
+        # spaces and silently returns garbage. main.py reads this at boot and
+        # warns loudly on a mismatch, turning a silent retrieval bug into a log line.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gita_corpus_meta (
+                id          SERIAL PRIMARY KEY,
+                embed_model TEXT,
+                dim         INTEGER,
+                chunk_count INTEGER,
+                ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("DELETE FROM gita_corpus_meta"))
+        conn.execute(
+            text("INSERT INTO gita_corpus_meta (embed_model, dim, chunk_count) VALUES (:m, :d, :c)"),
+            {"m": EMBED_MODEL, "d": dim, "c": len(chunks)},
+        )
+        print(f"  -> stamped corpus meta: model={EMBED_MODEL} dim={dim}")
+
         # Cosine-distance index. Optional for ~4k rows (brute force is instant),
         # but cheap to add and future-proofs a larger corpus. Don't fail the
         # ingest if the pgvector build doesn't support hnsw.

@@ -446,9 +446,57 @@ def _ensure_crisis_events_table():
         _log_exc("CRISIS_EVENTS TABLE INIT FAILED (non-fatal)", e)
 
 
+def _verify_embedding_model():
+    """Warn loudly at boot if the serving embedding model differs from the one
+    that built the corpus.
+
+    A mismatch is silent and catastrophic for RAG: query vectors and stored
+    vectors then live in different embedding spaces, so cosine search returns
+    effectively random passages. ingest_corpus.py stamps the model it used into
+    gita_corpus_meta; here we compare it to the model this process will embed
+    queries with. If the meta row is missing (corpus predates the stamp), we say
+    so and point at a re-ingest rather than guessing.
+    """
+    try:
+        from embeddings import EMBED_MODEL
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT embed_model, dim FROM gita_corpus_meta ORDER BY ingested_at DESC LIMIT 1"
+            )).fetchone()
+        if not row:
+            print(
+                f"⚠️ Corpus embedding model unknown (gita_corpus_meta empty/absent). "
+                f"Serving queries with '{EMBED_MODEL}'. Re-run ingest_corpus.py to stamp the corpus."
+            )
+            return
+        stored_model, stored_dim = row[0], row[1]
+        if stored_model != EMBED_MODEL:
+            print(
+                f"🚨 EMBEDDING MODEL MISMATCH: corpus built with '{stored_model}' but queries "
+                f"embed with '{EMBED_MODEL}'. RAG retrieval is degraded until these match — "
+                f"re-ingest, or set VERTEX_EMBED_MODEL='{stored_model}'."
+            )
+        else:
+            print(f"✅ Embedding model matches corpus: {EMBED_MODEL} (dim {stored_dim}).")
+    except Exception as e:
+        _log_exc("EMBED MODEL VERIFY FAILED (non-fatal)", e)
+
+
 _ensure_metrics_table()
 _ensure_lesson_progress_table()
 _ensure_crisis_events_table()
+_verify_embedding_model()
+
+# Make admin-signup availability obvious in the boot logs. If ADMIN_SIGNUP_CODE is
+# unset in this environment (e.g. not configured on Cloud Run), EVERY signup —
+# even one that submits an admin code — is created as a plain "user", which is the
+# usual cause of a new "admin" account hitting "Access Denied". This one line tells
+# you from the logs whether admin signup is even possible here.
+print(
+    "🔐 Admin signup ENABLED (a matching ADMIN_SIGNUP_CODE grants admin)."
+    if ADMIN_SIGNUP_CODE else
+    "🔐 Admin signup DISABLED — ADMIN_SIGNUP_CODE is unset, so all signups become regular users."
+)
 
 
 def _log_crisis_event(request: ChatRequest):
@@ -585,7 +633,12 @@ def _build_messages(request: ChatRequest) -> list:
 
 
 @app.post("/api/chat")
-def chat_with_gita(request: ChatRequest, _rl: None = Depends(rate_limit_chat)):
+def chat_with_gita(request: ChatRequest, user: dict = Depends(require_user),
+                   _rl: None = Depends(rate_limit_chat)):
+    # Trust the authenticated identity from the token, not the client-supplied
+    # body email — so telemetry/crisis logs can't be spoofed and anonymous
+    # callers can't run up the (paid) model. session_id stays client-supplied.
+    request.email = user["sub"]
     print(
         f"💬 /api/chat session={request.session_id} email={request.email} "
         f"msg_len={len(request.message)} history_turns={len(request.history or [])} "
@@ -688,7 +741,15 @@ def register_user(request: RegisterRequest):
                 "name": request.name,
                 "role": assigned_role
             })
-            return {"status": "success", "message": f"User registered successfully as {assigned_role}!"}
+            # Return the ACTUAL assigned role so the client can tell the user when
+            # an entered admin code wasn't accepted (root cause of the "I made an
+            # admin account but get Access Denied" confusion): a wrong/blank code
+            # silently downgrades to "user", and the UI can now say so at signup.
+            return {
+                "status": "success",
+                "role": assigned_role,
+                "message": f"User registered successfully as {assigned_role}!",
+            }
             
     except HTTPException:
         raise
