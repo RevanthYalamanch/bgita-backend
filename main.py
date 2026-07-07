@@ -102,7 +102,7 @@ class LessonAnalyze(BaseModel):
     # Internal coaching context for this lesson (data/curriculum.js ai_prompt_context
     # plus the lesson goal and what the exercise asked). Never shown to the user;
     # steers the model's framing so the reflection isn't generic/nonsensical.
-    context: Optional[str] = Field(default=None, max_length=4000)
+    context: Optional[str] = Field(default=None, max_length=8000)
     # "reflect" → short reflection on the Practice-step answers (default).
     # "takeaway" → a warm response to the commitment the user wrote on the Commit step.
     mode: Optional[str] = Field(default="reflect", max_length=20)
@@ -248,6 +248,23 @@ Guidelines for your response Formatting (CRITICAL):
 - Use **bold text** to gently emphasize key psychological terms or core takeaways."""
 
 
+# Lesson reflections reuse the main voice but with a tighter mandate. The main
+# SYSTEM_PROMPT's guideline #9 ("provide historical background with specific
+# examples") pulls against the secular no-naming rule and could make the guide
+# name the source story mid-reflection — bad here, where the whole point is to
+# stay inside the user's own example. This override neutralizes that and pins the
+# format to short plain paragraphs (a short bulleted chain is fine when mirroring
+# their answers back as the lesson's framework).
+ANALYSIS_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    "\n\nLESSON-REFLECTION OVERRIDE (takes precedence over the content guidelines "
+    "above): You are reflecting on one person's exercise answers, not answering a "
+    "question. Do NOT provide historical background, and never name or allude to any "
+    "source text, story, teacher, or characters. Stay entirely within the user's own "
+    "words and plain modern language. No headings; keep to short paragraphs, with at "
+    "most one short bulleted chain when you mirror their answers back."
+)
+
+
 # Per-call generation configs. The system prompt + token cap + thinking budget are
 # passed to generate_content_stream(...) via a GenerateContentConfig on each call.
 #
@@ -273,12 +290,12 @@ CHAT_CONFIG = types.GenerateContentConfig(
     thinking_config=types.ThinkingConfig(thinking_budget=CHAT_THINKING_BUDGET),
 )
 REFLECT_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
+    system_instruction=ANALYSIS_SYSTEM_PROMPT,
     max_output_tokens=REFLECT_MAX_TOKENS,
     thinking_config=types.ThinkingConfig(thinking_budget=LESSON_THINKING_BUDGET),
 )
 TAKEAWAY_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
+    system_instruction=ANALYSIS_SYSTEM_PROMPT,
     max_output_tokens=TAKEAWAY_MAX_TOKENS,
     thinking_config=types.ThinkingConfig(thinking_budget=LESSON_THINKING_BUDGET),
 )
@@ -1031,10 +1048,17 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
             f"{db_block}"
             "Here are the answers the person typed for this exercise:\n\n"
             f"{request.answers}\n\n"
-            "Write a thoughtful, well-developed reflection back to them now. "
-            "Validate their feelings, connect their answers to the lesson's insight, "
-            "and leave them with one concrete takeaway or a gentle question. "
-            "Keep your reflection to 150 words or less."
+            "Reflect their answers back through the lens of what THIS lesson taught "
+            "(see the insight and worked example in the guide context above). In a warm, "
+            "plain voice:\n"
+            "1. Briefly acknowledge the feeling, using their own words.\n"
+            "2. Lay their answers out as the lesson's framework — name each part using the "
+            "exact structure and terms from the insight and worked example, quoting what "
+            "they actually wrote.\n"
+            "3. Spotlight the single link or shift that is the heart of the lesson, so they "
+            "see it inside their own example.\n"
+            "Stay grounded in their words. Don't add new exercises, don't correct or grade "
+            "them, and don't end on a separate question. Keep it under 150 words."
         )
         reply_config = REFLECT_CONFIG
 
