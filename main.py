@@ -118,12 +118,24 @@ class LessonAnalyze(BaseModel):
 # Cap how many prior turns we replay to the model, to bound prompt size/cost.
 MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "12"))
 
-# Allow your frontend to talk to this backend
+# Allow your frontend to talk to this backend.
+#   - Web (Vercel): the *.vercel.app regex + localhost:3000 for `next dev`.
+#   - Native (Capacitor iOS/Android): the app's WebView loads from a local
+#     origin and calls this backend directly (no Next.js proxy on device), so
+#     those origins must be allowed too — iOS is capacitor://localhost, Android
+#     (default androidScheme=https) is https://localhost. http://localhost
+#     covers `cap run` / older schemes. See frontend lib/api.js.
+_NATIVE_ORIGINS = [
+    "capacitor://localhost",
+    "https://localhost",
+    "http://localhost",
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex = r"https://.*\.vercel\.app",
     allow_origins=[
-        "http://localhost:3000" 
+        "http://localhost:3000",
+        *_NATIVE_ORIGINS,
     ],
     allow_credentials=True,
     allow_methods=["*"],
