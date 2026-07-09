@@ -115,6 +115,19 @@ class LessonAnalyze(BaseModel):
             raise ValueError("answers must not be empty")
         return v
 
+class ToolEvent(BaseModel):
+    # One use of an SOS/"Reset" coping tool (breathing, grounding, urge surfing,
+    # TIPP). Best-effort telemetry: powers outcome data for the clinician portal
+    # and future user insights. Identity comes from the auth token, never here.
+    # pre_/post_distress are the optional SUDS 0–10 self-ratings; their delta is
+    # the outcome signal (how much distress the tool took off).
+    tool_id: str = Field(min_length=1, max_length=50)
+    session_id: Optional[str] = Field(default="anonymous_session", max_length=128)
+    duration_sec: Optional[int] = Field(default=None, ge=0, le=7200)
+    completed: Optional[bool] = False
+    pre_distress: Optional[int] = Field(default=None, ge=0, le=10)
+    post_distress: Optional[int] = Field(default=None, ge=0, le=10)
+
 # Cap how many prior turns we replay to the model, to bound prompt size/cost.
 MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "12"))
 
@@ -475,6 +488,33 @@ def _ensure_crisis_events_table():
         _log_exc("CRISIS_EVENTS TABLE INIT FAILED (non-fatal)", e)
 
 
+def _ensure_tool_events_table():
+    """Create the SOS/coping-tool telemetry table once at startup (idempotent).
+
+    Records each use of a Reset-toolkit tool plus the optional pre/post SUDS
+    (0–10) self-ratings. The pre−post delta is the outcome signal surfaced in the
+    clinician portal ("breathing takes ~N points off distress on average").
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS tool_events (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    tool_id VARCHAR(50),
+                    session_id VARCHAR(128),
+                    duration_sec INTEGER,
+                    completed BOOLEAN DEFAULT FALSE,
+                    pre_distress INTEGER,
+                    post_distress INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+        print("✅ tool_events table ensured.")
+    except Exception as e:
+        _log_exc("TOOL_EVENTS TABLE INIT FAILED (non-fatal)", e)
+
+
 def _verify_embedding_model():
     """Warn loudly at boot if the serving embedding model differs from the one
     that built the corpus.
@@ -518,6 +558,7 @@ def _verify_embedding_model():
 _ensure_metrics_table()
 _ensure_lesson_progress_table()
 _ensure_crisis_events_table()
+_ensure_tool_events_table()
 _verify_embedding_model()
 
 # Make admin-signup availability obvious in the boot logs. If ADMIN_SIGNUP_CODE is
@@ -868,6 +909,40 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
         raise HTTPException(status_code=500, detail="Could not save your entry. Please try again.") from e
 
 
+@app.post("/api/tools/log")
+def log_tool_event(event: ToolEvent, db: Session = Depends(get_db),
+                   user: dict = Depends(require_user)):
+    """Record one use of an SOS/"Reset" coping tool (best-effort telemetry).
+
+    Powers outcome data for the clinician portal + future user insights: which
+    tools get used and, when the user rates it, how much distress dropped
+    (pre − post). Identity comes from the token, never the body.
+
+    Logging must NEVER break a coping session, so a DB failure is swallowed and
+    still returns 200 — the client fires this and ignores the result.
+    """
+    try:
+        db.execute(text("""
+            INSERT INTO tool_events
+                (email, tool_id, session_id, duration_sec, completed, pre_distress, post_distress, created_at)
+            VALUES (:email, :tool_id, :session_id, :duration_sec, :completed, :pre_distress, :post_distress, NOW())
+        """), {
+            "email": user["sub"],
+            "tool_id": event.tool_id,
+            "session_id": event.session_id,
+            "duration_sec": event.duration_sec,
+            "completed": bool(event.completed),
+            "pre_distress": event.pre_distress,
+            "post_distress": event.post_distress,
+        })
+        db.commit()
+        return {"status": "success"}
+    except Exception as e:
+        db.rollback()
+        _log_exc("TOOL EVENT LOG ERROR (non-fatal)", e)
+        return {"status": "skipped"}
+
+
 @app.get("/api/logs")
 def get_daily_logs(user: dict = Depends(require_user), db: Session = Depends(get_db)):
     """Return the authenticated user's past daily check-ins, most recent first.
@@ -1152,7 +1227,28 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                 _log_exc("ADMIN METRICS: crisis_events read failed (non-fatal)", e)
                 crisis_list = []
 
-            # 5. 📈 Aggregate summary cards. Each stat is independently failsafe so a
+            # 5. 🧰 Fetch coping-tool (SOS/Reset) usage, aggregated per tool with
+            # its average distress drop (pre − post SUDS). A NULL delta (rating
+            # skipped) is ignored by AVG, so avg_drop reflects only rated sessions.
+            try:
+                tool_query = text("""
+                    SELECT tool_id,
+                           COUNT(*) AS uses,
+                           ROUND(AVG(pre_distress - post_distress)::numeric, 1) AS avg_drop
+                    FROM tool_events
+                    GROUP BY tool_id
+                    ORDER BY uses DESC
+                """)
+                tool_results = conn.execute(tool_query).fetchall()
+                tools_list = [
+                    {"tool_id": r[0], "uses": int(r[1]), "avg_drop": float(r[2]) if r[2] is not None else None}
+                    for r in tool_results
+                ]
+            except Exception as e:
+                _log_exc("ADMIN METRICS: tool_events read failed (non-fatal)", e)
+                tools_list = []
+
+            # 6. 📈 Aggregate summary cards. Each stat is independently failsafe so a
             # single missing table can't blank the whole strip. mood is stored as
             # TEXT ("1".."5"), so it must be cast before averaging.
             summary = {}
@@ -1163,6 +1259,8 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                 ("lessons_completed", "SELECT COUNT(*) FROM lesson_progress"),
                 ("avg_mood", "SELECT ROUND(AVG(NULLIF(mood, '')::float)::numeric, 2) FROM logs"),
                 ("crisis_count", "SELECT COUNT(*) FROM crisis_events"),
+                ("tool_sessions", "SELECT COUNT(*) FROM tool_events"),
+                ("avg_distress_drop", "SELECT ROUND(AVG(pre_distress - post_distress)::numeric, 1) FROM tool_events"),
             ):
                 try:
                     val = conn.execute(text(query)).scalar()
@@ -1179,7 +1277,8 @@ def get_admin_metrics(_admin: dict = Depends(require_admin)):
                     "telemetry": ai_list,
                     "lessons": lesson_list,
                     "logs": log_list,
-                    "crisis": crisis_list
+                    "crisis": crisis_list,
+                    "tools": tools_list
                 }
             }
             
@@ -1229,8 +1328,31 @@ def get_patient_detail(email: str, _admin: dict = Depends(require_admin)):
                     _log_exc("PATIENT DETAIL: scalar failed (non-fatal)", e)
                     return default
 
+            # Coping-tool usage for this patient, per tool + average distress drop.
+            try:
+                ptool_rows = conn.execute(
+                    text("""
+                        SELECT tool_id,
+                               COUNT(*) AS uses,
+                               ROUND(AVG(pre_distress - post_distress)::numeric, 1) AS avg_drop
+                        FROM tool_events
+                        WHERE email = :email
+                        GROUP BY tool_id
+                        ORDER BY uses DESC
+                    """),
+                    {"email": email},
+                ).fetchall()
+                tools = [
+                    {"tool_id": r[0], "uses": int(r[1]), "avg_drop": float(r[2]) if r[2] is not None else None}
+                    for r in ptool_rows
+                ]
+            except Exception as e:
+                _log_exc("PATIENT DETAIL: tools failed (non-fatal)", e)
+                tools = []
+
             chat_count = _scalar("SELECT COUNT(*) FROM ai_metrics_log WHERE email = :email")
             crisis_count = _scalar("SELECT COUNT(*) FROM crisis_events WHERE email = :email")
+            tool_count = _scalar("SELECT COUNT(*) FROM tool_events WHERE email = :email")
             last_active = _scalar("SELECT MAX(created_at) FROM ai_metrics_log WHERE email = :email", default=None)
 
             return {
@@ -1239,8 +1361,10 @@ def get_patient_detail(email: str, _admin: dict = Depends(require_admin)):
                     "email": email,
                     "mood_series": mood_series,
                     "lessons": lessons,
+                    "tools": tools,
                     "chat_count": int(chat_count),
                     "crisis_count": int(crisis_count),
+                    "tool_count": int(tool_count),
                     "last_active": str(last_active) if last_active is not None else None,
                 },
             }
