@@ -42,6 +42,24 @@ class LogCreate(BaseModel):
     email: Optional[str] = None
     mood_score: int
     diary_text: str
+    # Rich mood-logging fields (all optional so older clients keep working and
+    # the overall mood_score alone is still a valid check-in). Lists are capped
+    # to bound payload size; energy is a 1–5 self-rating parallel to mood.
+    emotions: Optional[List[str]] = Field(default=None, max_length=20)
+    energy: Optional[int] = Field(default=None, ge=1, le=5)
+    sleep: Optional[str] = Field(default=None, max_length=50)
+    activities: Optional[List[str]] = Field(default=None, max_length=20)
+
+class AssessmentCreate(BaseModel):
+    # A completed standardized screening (PHQ-9 depression or GAD-7 anxiety).
+    # The client scores it too, but we recompute server-side from `answers` so a
+    # tampered/mismatched total can't land bad clinical data. Identity comes
+    # from the auth token, never the body.
+    assessment_type: Literal["phq9", "gad7"]
+    # One 0–3 response per item (PHQ-9 = 9 items, GAD-7 = 7). Validated by length
+    # + range in the endpoint against the expected item count for the type.
+    answers: List[int] = Field(min_length=1, max_length=27)
+    session_id: Optional[str] = Field(default="onboarding", max_length=128)
 
 class AuthRequest(BaseModel):
     email: str
@@ -515,6 +533,56 @@ def _ensure_tool_events_table():
         _log_exc("TOOL_EVENTS TABLE INIT FAILED (non-fatal)", e)
 
 
+def _ensure_logs_columns():
+    """Add the rich mood-logging columns to the existing `logs` table (idempotent).
+
+    The daily check-in used to be just mood (1–5) + a free-text reflection. Rich
+    logging adds emotions/energy/sleep/activity context. We ALTER rather than
+    recreate so historical rows are untouched (they read back as NULL) and the
+    admin portal — which reads `mood`/`reflection` — is unaffected. `emotions`
+    and `activities` hold delimiter-joined controlled-vocabulary labels.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                ALTER TABLE logs
+                    ADD COLUMN IF NOT EXISTS emotions TEXT,
+                    ADD COLUMN IF NOT EXISTS energy INTEGER,
+                    ADD COLUMN IF NOT EXISTS sleep VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS activities TEXT
+            """))
+        print("✅ logs rich-mood columns ensured.")
+    except Exception as e:
+        _log_exc("LOGS COLUMNS INIT FAILED (non-fatal)", e)
+
+
+def _ensure_assessments_table():
+    """Create the standardized-screening table once at startup (idempotent).
+
+    Stores each completed PHQ-9 (depression) / GAD-7 (anxiety) screening: the
+    per-item answers, the recomputed total score, and the severity band. The
+    first pair is the onboarding baseline; later ones power the symptom-trend
+    view. Score/severity are derived server-side in the endpoint.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS assessments (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    assessment_type VARCHAR(20),
+                    score INTEGER,
+                    severity VARCHAR(40),
+                    answers TEXT,
+                    session_id VARCHAR(128),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+        print("✅ assessments table ensured.")
+    except Exception as e:
+        _log_exc("ASSESSMENTS TABLE INIT FAILED (non-fatal)", e)
+
+
 def _verify_embedding_model():
     """Warn loudly at boot if the serving embedding model differs from the one
     that built the corpus.
@@ -559,6 +627,8 @@ _ensure_metrics_table()
 _ensure_lesson_progress_table()
 _ensure_crisis_events_table()
 _ensure_tool_events_table()
+_ensure_logs_columns()
+_ensure_assessments_table()
 _verify_embedding_model()
 
 # Make admin-signup availability obvious in the boot logs. If ADMIN_SIGNUP_CODE is
@@ -878,6 +948,61 @@ def login_user(request: LoginRequest):
         raise HTTPException(status_code=500, detail="Could not log you in. Please try again.") from e
 
 
+# Rich mood-logging lists (emotions/activities) are stored as delimiter-joined
+# text in single columns. `|` avoids colliding with commas inside labels and is
+# never part of the controlled vocabulary the client sends.
+_LABEL_DELIM = " | "
+
+
+def _join_labels(items) -> Optional[str]:
+    """Join a client-sent label list into one column value (None if empty)."""
+    if not items:
+        return None
+    cleaned = [str(x).strip() for x in items if str(x).strip()]
+    return _LABEL_DELIM.join(cleaned) if cleaned else None
+
+
+def _split_labels(value) -> list:
+    """Inverse of _join_labels for reads; tolerant of NULL and legacy commas."""
+    if not value:
+        return []
+    raw = value.split("|") if "|" in value else value.split(",")
+    return [p.strip() for p in raw if p.strip()]
+
+
+# Standardized-screening scoring. Each item is answered 0–3; the total maps to a
+# severity band using the published clinical cutoffs. PHQ-9 (depression) has 9
+# items (total 0–27), GAD-7 (anxiety) has 7 (total 0–21). The score is always
+# recomputed server-side from the raw answers so a tampered client total can't
+# persist bad clinical data.
+_ASSESSMENT_SPEC = {
+    "phq9": {"items": 9, "max": 27},
+    "gad7": {"items": 7, "max": 21},
+}
+
+
+def _assessment_severity(atype: str, score: int) -> str:
+    """Map a screening total to its severity band."""
+    if atype == "phq9":
+        if score <= 4:
+            return "Minimal"
+        if score <= 9:
+            return "Mild"
+        if score <= 14:
+            return "Moderate"
+        if score <= 19:
+            return "Moderately severe"
+        return "Severe"
+    # gad7
+    if score <= 4:
+        return "Minimal"
+    if score <= 9:
+        return "Mild"
+    if score <= 14:
+        return "Moderate"
+    return "Severe"
+
+
 @app.post("/api/logs")
 async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
                          user: dict = Depends(require_user)):
@@ -886,20 +1011,28 @@ async def save_daily_log(log: LogCreate, db: Session = Depends(get_db),
         # so a user can only write journal entries under their own account.
         username = user["sub"]
 
-        # We updated the column names to match your X-ray exactly!
+        # `mood`/`reflection` keep their original meaning (admin AVG(mood) + the
+        # mood sparkline still work); the rich fields land in the columns added
+        # by _ensure_logs_columns(). Lists are flattened to delimited text.
         query = text("""
-            INSERT INTO logs (username, timestamp, mood, activity, reflection)
-            VALUES (:username, NOW(), :mood, :activity, :reflection)
+            INSERT INTO logs (username, timestamp, mood, activity, reflection,
+                              emotions, energy, sleep, activities)
+            VALUES (:username, NOW(), :mood, :activity, :reflection,
+                    :emotions, :energy, :sleep, :activities)
         """)
 
         db.execute(query, {
             "username": username,          # Saving their email into the 'username' column
             "mood": str(log.mood_score),   # Converting the 1-5 number into TEXT
             "activity": "Daily Journal",   # Filling the required activity column with a default label
-            "reflection": log.diary_text   # Saving the paragraph into the 'reflection' column
+            "reflection": log.diary_text,  # Saving the paragraph into the 'reflection' column
+            "emotions": _join_labels(log.emotions),
+            "energy": log.energy,
+            "sleep": (log.sleep or None),
+            "activities": _join_labels(log.activities),
         })
         db.commit()
-        
+
         return {"status": "success", "message": "Journal entry saved to database!"}
     except Exception as e:
         db.rollback()
@@ -953,7 +1086,7 @@ def get_daily_logs(user: dict = Depends(require_user), db: Session = Depends(get
     """
     try:
         rows = db.execute(text("""
-            SELECT mood, reflection, timestamp
+            SELECT mood, reflection, timestamp, emotions, energy, sleep, activities
             FROM logs
             WHERE username = :username AND activity = 'Daily Journal'
             ORDER BY timestamp DESC
@@ -961,13 +1094,121 @@ def get_daily_logs(user: dict = Depends(require_user), db: Session = Depends(get
         """), {"username": user["sub"]}).fetchall()
         return {
             "entries": [
-                {"mood": r[0], "reflection": r[1], "timestamp": str(r[2])}
+                {
+                    "mood": r[0],
+                    "reflection": r[1],
+                    "timestamp": str(r[2]),
+                    "emotions": _split_labels(r[3]),
+                    "energy": r[4],
+                    "sleep": r[5],
+                    "activities": _split_labels(r[6]),
+                }
                 for r in rows
             ]
         }
     except Exception as e:
         _log_exc("LOG FETCH ERROR", e)
         raise HTTPException(status_code=500, detail="Could not load your entries.") from e
+
+
+@app.post("/api/assessment")
+def save_assessment(assessment: AssessmentCreate, db: Session = Depends(get_db),
+                    user: dict = Depends(require_user)):
+    """Record a completed PHQ-9 / GAD-7 screening and return the scored result.
+
+    Unlike the coping-tool telemetry this is clinical data, so a DB failure is a
+    real error (not swallowed). The score + severity band are recomputed here
+    from the raw per-item answers — never trusted from the client — so a tampered
+    total can't land bad data. Identity comes from the token, not the body.
+    """
+    spec = _ASSESSMENT_SPEC[assessment.assessment_type]
+    # Exactly one answer per screening item, each in the 0–3 response range.
+    if len(assessment.answers) != spec["items"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{assessment.assessment_type} expects {spec['items']} answers.",
+        )
+    if any(a < 0 or a > 3 for a in assessment.answers):
+        raise HTTPException(status_code=422, detail="Each answer must be between 0 and 3.")
+
+    score = sum(assessment.answers)
+    severity = _assessment_severity(assessment.assessment_type, score)
+
+    # PHQ-9 item 9 screens for thoughts of self-harm; any non-zero answer is a
+    # safety signal. Surface crisis resources to the user (via `alert`) and
+    # persist a crisis event for the clinician portal — best-effort, mirroring
+    # the chat crisis path so it never blocks saving the screening.
+    alert = assessment.assessment_type == "phq9" and assessment.answers[8] > 0
+    if alert:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO crisis_events (session_id, email, message_excerpt)
+                    VALUES (:session_id, :email, :excerpt)
+                """), {
+                    "session_id": f"assessment-{assessment.session_id}",
+                    "email": user["sub"],
+                    "excerpt": f"PHQ-9 item 9 (self-harm) = {assessment.answers[8]}; total {score}.",
+                })
+        except Exception as e:
+            _log_exc("ASSESSMENT CRISIS LOG FAILED (non-fatal)", e)
+
+    try:
+        db.execute(text("""
+            INSERT INTO assessments
+                (email, assessment_type, score, severity, answers, session_id, created_at)
+            VALUES (:email, :atype, :score, :severity, :answers, :session_id, NOW())
+        """), {
+            "email": user["sub"],
+            "atype": assessment.assessment_type,
+            "score": score,
+            "severity": severity,
+            # Raw per-item answers kept as comma-joined text for later review.
+            "answers": ",".join(str(a) for a in assessment.answers),
+            "session_id": assessment.session_id,
+        })
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        _log_exc("ASSESSMENT SAVE ERROR", e)
+        raise HTTPException(status_code=500, detail="Could not save your responses. Please try again.") from e
+
+    return {
+        "status": "success",
+        "assessment_type": assessment.assessment_type,
+        "score": score,
+        "max_score": spec["max"],
+        "severity": severity,
+        "alert": alert,
+    }
+
+
+@app.get("/api/assessment")
+def get_assessments(user: dict = Depends(require_user), db: Session = Depends(get_db)):
+    """Return the user's past screenings (most recent first) for the trend view."""
+    try:
+        rows = db.execute(text("""
+            SELECT assessment_type, score, severity, created_at
+            FROM assessments
+            WHERE email = :email
+            ORDER BY created_at DESC
+            LIMIT 90
+        """), {"email": user["sub"]}).fetchall()
+        return {
+            "assessments": [
+                {
+                    "assessment_type": r[0],
+                    "score": r[1],
+                    "severity": r[2],
+                    "max_score": _ASSESSMENT_SPEC.get(r[0], {}).get("max"),
+                    "timestamp": str(r[3]),
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        _log_exc("ASSESSMENT FETCH ERROR", e)
+        raise HTTPException(status_code=500, detail="Could not load your assessments.") from e
 
 
 @app.post("/api/lesson/complete")
