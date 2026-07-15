@@ -14,7 +14,8 @@ from auth import (
     hash_password, verify_password, needs_rehash, ADMIN_SIGNUP_CODE,
     create_access_token, decode_access_token,
 )
-from safety import detect_crisis, CRISIS_RESPONSE
+from safety import (detect_crisis, CRISIS_RESPONSE,
+                    detect_harm_to_others, HARM_TO_OTHERS_RESPONSE)
 from ratelimit import SlidingWindowLimiter
 from sqlalchemy.orm import Session
 from typing import Optional, List, Literal
@@ -498,9 +499,16 @@ def _ensure_crisis_events_table():
                     session_id VARCHAR(255),
                     email VARCHAR(255),
                     message_excerpt TEXT,
+                    category VARCHAR(32) DEFAULT 'self_harm',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
+            # Idempotent upgrade for tables created before the harm-to-others
+            # screen existed: add the category column if it's missing.
+            conn.execute(text(
+                "ALTER TABLE crisis_events "
+                "ADD COLUMN IF NOT EXISTS category VARCHAR(32) DEFAULT 'self_harm'"
+            ))
         print("✅ crisis_events table ensured.")
     except Exception as e:
         _log_exc("CRISIS_EVENTS TABLE INIT FAILED (non-fatal)", e)
@@ -643,19 +651,25 @@ print(
 )
 
 
-def _log_crisis_event(request: ChatRequest):
-    """Persist a detected crisis event. Best-effort: never raises into the request path."""
+def _log_crisis_event(request: ChatRequest, category: str = "self_harm"):
+    """Persist a detected crisis event. Best-effort: never raises into the request path.
+
+    category distinguishes the self-harm screen ('self_harm') from the
+    harm-to-others screen ('harm_to_others') so the clinician portal can triage
+    them differently.
+    """
     try:
         with engine.begin() as conn:
             conn.execute(
                 text("""
-                    INSERT INTO crisis_events (session_id, email, message_excerpt)
-                    VALUES (:session_id, :email, :excerpt)
+                    INSERT INTO crisis_events (session_id, email, message_excerpt, category)
+                    VALUES (:session_id, :email, :excerpt, :category)
                 """),
                 {
                     "session_id": request.session_id,
                     "email": request.email,
                     "excerpt": (request.message or "")[:280],
+                    "category": category,
                 },
             )
     except Exception as e:
@@ -802,6 +816,20 @@ def chat_with_gita(request: ChatRequest, user: dict = Depends(require_user),
             _log_chat_metrics(request, 0.0, 0, 0)
 
         return StreamingResponse(crisis_stream(), media_type="text/plain")
+
+    # Second safety screen: explicit intent to seriously harm OTHERS. Separate,
+    # higher-precision detector (see safety.py) so trauma survivors, Harm-OCD
+    # intrusive thoughts, and everyday hyperbole are NOT misflagged. Surfaces the
+    # session to the clinician portal; it does NOT auto-report to anyone.
+    if detect_harm_to_others(request.message):
+        print(f"⚠️ Harm-to-others language detected for session={request.session_id}")
+        _log_crisis_event(request, category="harm_to_others")
+
+        def harm_others_stream():
+            yield HARM_TO_OTHERS_RESPONSE
+            _log_chat_metrics(request, 0.0, 0, 0)
+
+        return StreamingResponse(harm_others_stream(), media_type="text/plain")
 
     if client is None:
         print("🚨 /api/chat called but Gemini (Vertex) client is None (init failed — check ADC / project / region).")
@@ -1336,6 +1364,15 @@ def analyze_lesson(request: LessonAnalyze, user: dict = Depends(require_user),
             yield CRISIS_RESPONSE
 
         return StreamingResponse(crisis_stream(), media_type="text/plain")
+
+    # Second safety screen: explicit intent to seriously harm others.
+    if detect_harm_to_others(request.answers):
+        print(f"⚠️ Harm-to-others language detected in lesson analysis for {user['sub']}")
+
+        def harm_others_stream():
+            yield HARM_TO_OTHERS_RESPONSE
+
+        return StreamingResponse(harm_others_stream(), media_type="text/plain")
 
     if client is None:
         print("🚨 /api/lesson/analyze called but Gemini (Vertex) client is None (init failed — check ADC / project / region).")

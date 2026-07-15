@@ -96,3 +96,101 @@ def detect_crisis(message: str) -> bool:
     if not message:
         return False
     return bool(_CRISIS_RE.search(message))
+
+
+# ===========================================================================
+# Harm-to-others (homicidal / mass-violence / sexual-violence intent) screen.
+#
+# This is a SEPARATE, higher-PRECISION screen from the self-harm one above, and
+# the trade-off is deliberately inverted. Self-harm detection over-triggers on
+# purpose. Here a false positive is itself harmful — wrongly treating a merely
+# frustrated user ("I'm gonna kill my boss"), someone with Harm-OCD intrusive
+# thoughts ("I'm terrified I might snap and hurt someone"), or — worst of all —
+# a trauma SURVIVOR disclosing abuse ("he raped me", "my dad used to hit me") as
+# a violent threat would be alienating and clinically damaging. So we fire ONLY
+# on explicit statements of the speaker's own INTENT / PLAN to seriously harm
+# others, we EXCLUDE fear-framed intrusive thoughts and victim disclosures, and
+# we leave ambiguous single-target hyperbole ("I could kill him") to the LLM +
+# system-prompt safety layer.
+#
+# IMPORTANT: a positive result only (a) shows the de-escalation message below and
+# (b) lets the app surface the session to a human in the clinician portal. It
+# MUST NOT trigger any automated report to third parties or authorities — any
+# duty-to-warn action is a human clinical/legal judgement, not something this
+# deterministic backstop should ever automate.
+# ===========================================================================
+
+# Fear / intrusive-thought / help-seeking framing that must NOT be read as a
+# threat (Harm-OCD, "what if I lose control", explicit reluctance to act).
+_HARM_OTHERS_EXCLUSIONS = re.compile(
+    r"(?:afraid|scared|scares?\s+me|terrified|worried|anxious|nervous|fear(?:ful)?)"
+    r"[^.!?\n]{0,40}?\b(?:hurt|harm|kill|murder|rape|hit|shoot|snap|lose\s+control|do\s+something)"
+    r"|what\s+if\s+i\b"
+    r"|intrusive\s+thought"
+    r"|don'?t\s+want\s+to\s+(?:hurt|harm|kill|act|do)"
+    r"|would\s+never\s+(?:actually|really|hurt|harm|do)",
+    re.IGNORECASE,
+)
+
+# Intent markers: the speaker planning/wanting to act (not fear, not past tense
+# by a third party). Kept as a fragment reused across patterns below.
+_INTENT = (r"(?:want(?:ing|ed|s)?\s+to|going\s+to|gonna|planning\s+(?:to|a)|"
+           r"plan\s+to|about\s+to|ready\s+to|going\s+to\s+finally)")
+
+_HARM_OTHERS_PATTERNS = [
+    # --- Mass violence: attacking a place or a group with a weapon ---
+    r"shoot(?:ing)?\s+up\s+(?:the\s+|my\s+|a\s+|this\s+)?"
+    r"(?:school|college|campus|church|mosque|synagogue|temple|office|workplace|"
+    r"mall|store|building|class(?:room)?|place|crowd)",
+    r"shoot(?:ing)?\s+(?:up\s+)?everyone",
+    r"kill(?:ing)?\s+everyone\s+(?:at|in|here|there)\b",
+    r"bring(?:ing)?\s+(?:a\s+|my\s+)?(?:gun|knife|weapon|firearm|rifle)\s+to\s+"
+    r"(?:school|work|class|campus|the\s+office|church)",
+    r"open\s+fire\s+on\b",
+    r"plant(?:ing)?\s+a\s+bomb",
+    r"blow\s+up\s+(?:the\s+|a\s+|this\s+)?(?:school|building|office|place|church|mall)",
+    r"(?:commit|carry\s+out|do)\s+(?:a\s+)?(?:school|mass|workplace|church)\s+shooting",
+    _INTENT + r"\s+(?:a\s+)?(?:school|mass|workplace|church)\s+shooting",
+    # --- Explicit intent to murder / kill a person or people ---
+    _INTENT + r"\s+murder\b",
+    r"\bmurder\s+(?:him|her|them|someone|everybody|everyone|people|my\s+\w+)",
+    _INTENT + r"\s+kill\s+(?:everyone|everybody|them\s+all|all\s+of\s+them|people|someone)\b",
+    # --- Explicit sexual-violence intent (the speaker's own intent only) ---
+    _INTENT + r"\s+(?:rape|sexually\s+assault|molest)\b",
+]
+
+_HARM_OTHERS_RE = re.compile("|".join(_HARM_OTHERS_PATTERNS), re.IGNORECASE)
+
+
+# Plain text (no markdown) — mirrors CRISIS_RESPONSE. Non-judgemental and
+# de-escalating: acknowledges the feeling, does not accuse, routes to real help
+# (911 for imminent danger; 988 also supports thoughts of harming others).
+HARM_TO_OTHERS_RESPONSE = (
+    "I hear how much pain and anger you're carrying right now, and I'm taking what "
+    "you said seriously. Thoughts about hurting someone else can be frightening and "
+    "overwhelming, and telling someone about them takes real courage.\n\n"
+    "I'm an AI and can't keep you or anyone else safe in a moment like this, so "
+    "please reach out to someone who can, right now:\n\n"
+    "- If you might act on this, or if anyone is in immediate danger, call 911 "
+    "(or your local emergency number) now.\n"
+    "- US: call or text 988 (Suicide & Crisis Lifeline) — they support people "
+    "having thoughts of harming themselves OR someone else, 24/7 and confidential.\n"
+    "- Anywhere: find a helpline near you at https://findahelpline.com\n\n"
+    "You don't have to act on these thoughts, and you don't have to face them "
+    "alone. Talking with a trained person right now can help you stay safe and "
+    "get through this. I'm still here with you too."
+)
+
+
+def detect_harm_to_others(message: str) -> bool:
+    """Return True if the message states explicit intent to seriously harm others.
+
+    Deliberately precise (see the section notes above): fear-framed intrusive
+    thoughts and victim/survivor disclosures are excluded so they are NOT
+    misread as threats.
+    """
+    if not message:
+        return False
+    if _HARM_OTHERS_EXCLUSIONS.search(message):
+        return False
+    return bool(_HARM_OTHERS_RE.search(message))
