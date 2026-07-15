@@ -6,9 +6,8 @@ SHA-256 hex digests; verify_password() still accepts those so existing users can
 log in, and needs_rehash() flags them so the caller can transparently upgrade
 the stored hash to bcrypt on the next successful login.
 
-Privileged codes (admin signup, clinician access) come from the environment, not
-source — see .env. They are intentionally empty by default so a missing/blank
-code never grants elevated access.
+The admin-signup code comes from the environment, not source — see .env. It is
+intentionally empty by default so a missing/blank code never grants elevated access.
 """
 import os
 import re
@@ -20,9 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Codes that grant elevated roles. Blank by default => access denied.
+# Code that grants the elevated admin role at signup. Blank by default => access denied.
 ADMIN_SIGNUP_CODE = os.getenv("ADMIN_SIGNUP_CODE", "")
-CLINICIAN_KEY = os.getenv("CLINICIAN_SPECIAL_CODE", "")
 
 # Secret used to sign session tokens. MUST be set in the environment; blank => no
 # tokens can be issued or verified (fail closed).
@@ -87,10 +85,3 @@ def verify_password(plain: str, stored: str) -> bool:
 def needs_rehash(stored: str) -> bool:
     """True when the stored hash should be upgraded to current bcrypt on login."""
     return _is_legacy_sha256(stored)
-
-
-def verify_clinician(_email: str, code: str):
-    """Authorize a clinician based on the configured access code."""
-    if CLINICIAN_KEY and code == CLINICIAN_KEY:
-        return {"status": "authorized", "role": "psychiatrist"}
-    return {"status": "unauthorized", "role": "user"}
