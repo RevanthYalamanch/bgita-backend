@@ -267,7 +267,7 @@ except Exception as e:
 # Gemini as `system_instruction` (not interleaved with the user message), so the
 # model treats it as standing instructions rather than user-provided text.
 SYSTEM_PROMPT = """You are an empathetic, highly skilled Cognitive Behavioral Therapy (CBT) therapist.
-You draw upon the psychological frameworks found in the Bhagavad Gita, but you MUST present them using modern, accessible, secular western terminology.
+You draw upon time-tested psychological frameworks from ancient wisdom traditions, but you MUST present them using modern, accessible, secular western terminology. You MUST NOT name, quote, cite, or allude to any specific scripture, religious or spiritual text, tradition, deity, teacher, or their characters — present every idea as a plain, secular psychological principle.
 
 SAFETY (HIGHEST PRIORITY, overrides all formatting rules below):
 - If the user expresses any intent or desire to harm themselves or others, or to end their life, your FIRST priority is their safety, not therapy techniques.
@@ -276,14 +276,14 @@ SAFETY (HIGHEST PRIORITY, overrides all formatting rules below):
 
 Guidelines for your response Content:
 1. Translate ancient concepts into universal psychological principles.
-2. Avoid using Sanskrit terms, character names, or Indian metaphors unless asked.
+2. Never use Sanskrit terms, character names, religious references, or culturally specific metaphors — even if the user asks about a source, redirect to the plain secular principle without naming it.
 3. Validate the user's feelings first using standard CBT empathy.
-4. You may be given text retrieved from our clinical database. IF it is relevant, weave it in.
+4. You may be given text retrieved from our clinical database. IF it is relevant, paraphrase its insight into plain secular language — never quote it verbatim and never carry over any names, places, or archaic wording from it.
 5. IF the database text is not relevant, DO NOT mention the database.
 6. Never say "According to the database".
 7. Offer the user the ability to ask for the response in a simpler format.
 8. Use CBT-adjacent questions to engage users further.
-9. When a user asks a question, provide historical background with specific examples.
+9. When a user asks a question, ground your answer in concrete, practical examples — without citing any source text, tradition, or historical or religious figures.
 
 Guidelines for your response Formatting (CRITICAL):
 - NEVER output a single wall of text. Break your responses into short, easily digestible paragraphs (maximum 2-3 sentences per paragraph).
@@ -308,22 +308,6 @@ ANALYSIS_SYSTEM_PROMPT = SYSTEM_PROMPT + (
     "most one short bulleted chain when you mirror their answers back."
 )
 
-
-# Per-call generation configs. The system prompt + token cap + thinking budget are
-# passed to generate_content_stream(...) via a GenerateContentConfig on each call.
-#
-# Lesson "Practice" reflection (#2) and Commit-step takeaway (#3) both run on the
-# SAME standard chatbot system prompt as the main chat (SYSTEM_PROMPT) — per the
-# 6/29 request to replace the bespoke lesson prompts with the main one so the
-# guide's voice is consistent everywhere. The per-mode steering (reflect vs.
-# takeaway) is carried in the user turn assembled in analyze_lesson(), not here.
-# Only the token cap differs (shorter lesson replies).
-#
-# ⚠️ THINKING-BUDGET TRAP: these are short-output calls, but Gemini 2.5 Pro still
-# spends hidden thinking tokens that count against max_output_tokens. Reflection is
-# capped to ~150 words (~250 tokens) in the prompt, but we must leave headroom for
-# thinking on TOP of that or the visible reply truncates to nothing. So we bound
-# thinking to LESSON_THINKING_BUDGET and set max_output_tokens well above it.
 REFLECT_MAX_TOKENS = int(os.getenv("REFLECT_MAX_TOKENS", "1536"))
 TAKEAWAY_MAX_TOKENS = int(os.getenv("ANALYSIS_MAX_TOKENS", "1536"))
 LESSON_THINKING_BUDGET = int(os.getenv("LESSON_THINKING_BUDGET", "512"))
@@ -934,7 +918,51 @@ def register_user(request: RegisterRequest):
             raise HTTPException(status_code=409, detail="An account with that email already exists.") from e
         # Generic failure: still a true HTTP error so the frontend won't fake success.
         raise HTTPException(status_code=500, detail="Could not create the account. Please try again.") from e
-        
+
+
+@app.delete("/api/account")
+def delete_account(user: dict = Depends(require_user), db: Session = Depends(get_db)):
+    """Permanently delete the authenticated user's account and all their data.
+
+    Required for the Google Play / App Store account-deletion policy and to honor
+    the deletion right promised in the privacy policy. Identity comes from the
+    token (`sub` = email), never the request body, so a user can only delete
+    their own account.
+
+    All personal data lives keyed by the user's email. Note the `logs` table
+    stores the email in its `username` column (historical naming); every other
+    table uses an `email` column. Deletion is atomic: engine.begin() commits only
+    if every statement succeeds, so we never leave a half-deleted account.
+    """
+    email = user["sub"]
+
+    # (table, user-key column). Ordered children-first, users last, though the
+    # single transaction makes ordering immaterial here.
+    targets = [
+        ("logs", "username"),
+        ("assessments", "email"),
+        ("lesson_progress", "email"),
+        ("tool_events", "email"),
+        ("crisis_events", "email"),
+        ("ai_metrics_log", "email"),
+        ("users", "email"),
+    ]
+
+    try:
+        with engine.begin() as conn:
+            for table, col in targets:
+                # Table/column names are hardcoded above (never user input), so
+                # interpolating them into the SQL is safe; the value is bound.
+                conn.execute(
+                    text(f"DELETE FROM {table} WHERE {col} = :email"),
+                    {"email": email},
+                )
+        return {"status": "success", "message": "Your account and all associated data have been deleted."}
+    except Exception as e:
+        _log_exc("ACCOUNT DELETION FAILED", e)
+        raise HTTPException(status_code=500, detail="Could not delete your account. Please try again.") from e
+
+
 @app.post("/api/login")
 def login_user(request: LoginRequest):
     try:
